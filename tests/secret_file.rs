@@ -11,6 +11,15 @@ use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
 use rustix::termios::{Winsize, tcsetwinsize};
 
+const FNOX_CONFIG: &str = r#"
+[[entries]]
+id = "profile"
+label = "VPN profile"
+kind = "fnox-file"
+source = "~/.config/VPN $HOME; profile.conf"
+destination = "$XDG_CONFIG_HOME/secrets/token"
+"#;
+
 struct Fixture {
     _dir: tempfile::TempDir,
     root: PathBuf,
@@ -39,7 +48,9 @@ destination = "$XDG_CONFIG_HOME/secrets/token"
 
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_secsetter"));
-        command.env("XDG_CONFIG_HOME", &self.root);
+        command
+            .env("XDG_CONFIG_HOME", &self.root)
+            .env("PATH", &self.root);
         command
     }
 
@@ -64,7 +75,33 @@ destination = "$XDG_CONFIG_HOME/secrets/token"
         success(self.command().arg("list").output().unwrap())
     }
 
-    fn tui(&self) -> Tui {
+    fn fnox_stub(&self, body: &str) {
+        let executable = self.root.join("fnox");
+        fs::write(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+[ "$#" = 3 ] && [ "$1" = get ] && [ "$2" = --file ] &&
+  [ "$3" = '~/.config/VPN $HOME; profile.conf' ] || exit 45
+: > "$XDG_CONFIG_HOME/fnox-called"
+{body}
+"#,
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(executable, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn restore(&self, replace: bool) -> Output {
+        let mut command = self.command();
+        command.args(["restore", "profile"]);
+        if replace {
+            command.arg("--replace");
+        }
+        command.output().unwrap()
+    }
+
+    fn open_tui(&self) -> Tui {
         let (master, slave) = terminal();
         let child = self
             .command()
@@ -118,6 +155,87 @@ fn sets_and_replaces_a_whole_file_without_changing_the_input_bytes() {
     let new_metadata = fs::metadata(&destination).unwrap();
     assert_eq!(new_metadata.uid(), old_metadata.uid());
     assert_ne!(new_metadata.ino(), old_metadata.ino());
+}
+
+#[test]
+fn restores_the_literal_fnox_path_key_as_an_exact_private_file() {
+    let config = Fixture::with_config(FNOX_CONFIG);
+    config.fnox_stub(r#"printf '  synthetic-fnox\000\377\r\n'"#);
+
+    let output = success(config.restore(false));
+    assert!(!output.contains("synthetic-fnox"));
+    assert_private_file(&config.destination(), b"  synthetic-fnox\0\xff\r\n");
+}
+
+#[test]
+fn fnox_status_uses_only_the_local_file_and_restore_requires_approval_even_when_empty() {
+    let config = Fixture::with_config(FNOX_CONFIG);
+    config.fnox_stub(r#"printf 'replacement\n'"#);
+    let destination = config.destination();
+    let called = config.root.join("fnox-called");
+
+    assert_eq!(config.list(), "profile\tVPN profile\tNot set\n");
+    fs::create_dir(destination.parent().unwrap()).unwrap();
+    for existing in [b"".as_slice(), b"old"] {
+        fs::write(&destination, existing).unwrap();
+        let status = if existing.is_empty() {
+            "Not set"
+        } else {
+            "Set"
+        };
+        assert_eq!(config.list(), format!("profile\tVPN profile\t{status}\n"));
+        assert_failure(config.restore(false), "--replace");
+        assert_eq!(fs::read(&destination).unwrap(), existing);
+        assert!(!called.exists());
+    }
+
+    success(config.restore(true));
+    assert_private_file(&destination, b"replacement\n");
+}
+
+#[test]
+fn failed_fnox_fetches_name_the_source_and_leave_the_destination_intact() {
+    let config = Fixture::with_config(FNOX_CONFIG);
+    let destination = config.destination();
+    fs::create_dir(destination.parent().unwrap()).unwrap();
+    fs::write(&destination, b"old synthetic file").unwrap();
+
+    for (body, reason) in [
+        (None, "fnox executable not found"),
+        (
+            Some("printf 'secret-value\\n'; printf 'secret-value\\n' >&2; exit 42"),
+            "exit status: 42",
+        ),
+        (Some("printf 'secret-value\\n' >&2"), "empty output"),
+    ] {
+        if let Some(body) = body {
+            config.fnox_stub(body);
+        }
+        let output = config.restore(true);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("~/.config/VPN $HOME; profile.conf")
+        );
+        assert_failure(output, reason);
+        assert_eq!(fs::read(&destination).unwrap(), b"old synthetic file");
+    }
+}
+
+#[test]
+fn create_only_restore_keeps_a_file_created_during_the_fetch() {
+    let config = Fixture::with_config(FNOX_CONFIG);
+    let destination = config.destination();
+    let parent = destination.parent().unwrap();
+    fs::create_dir(parent).unwrap();
+    config.fnox_stub(
+        r#"
+printf 'concurrent file' > "$XDG_CONFIG_HOME/secrets/token"
+printf 'would-be replacement'
+"#,
+    );
+
+    assert_failure(config.restore(false), "--replace");
+    assert_eq!(fs::read(&destination).unwrap(), b"concurrent file");
+    assert_eq!(fs::read_dir(parent).unwrap().count(), 1);
 }
 
 #[test]
@@ -187,7 +305,7 @@ fn cli_set_rejects_terminal_stdin() {
 fn tui_masks_a_paste_and_waits_for_explicit_submission() {
     let config = Fixture::new();
     let destination = config.destination();
-    let mut tui = config.tui();
+    let mut tui = config.open_tui();
 
     tui.read_through("Token file — Not set");
     tui.send(b"\r");
@@ -244,7 +362,7 @@ key = ["token"]
     let original = "token: 'old-synthetic-token' # keep\n";
     fs::create_dir(path.parent().unwrap()).unwrap();
     fs::write(&path, original).unwrap();
-    let mut tui = config.tui();
+    let mut tui = config.open_tui();
 
     tui.read_through("GitLab token — Set");
     tui.send(b"\r");
@@ -280,6 +398,40 @@ key = ["token"]
     let output = String::from_utf8_lossy(&tui.output);
     assert!(!output.contains("synthetic-token"));
     assert!(!output.contains("discard-me"));
+}
+
+#[test]
+fn tui_restores_a_missing_file_and_asks_before_replacing_an_empty_file() {
+    let config = Fixture::with_config(FNOX_CONFIG);
+    config.fnox_stub(r#"printf 'synthetic-fnox\n'"#);
+    let destination = config.destination();
+    let called = config.root.join("fnox-called");
+    let mut tui = config.open_tui();
+
+    tui.read_through("VPN profile — Not set");
+    tui.send(b"\r");
+    tui.read_through("Restored");
+    assert_private_file(&destination, b"synthetic-fnox\n");
+
+    fs::write(&destination, b"").unwrap();
+    fs::remove_file(&called).unwrap();
+    tui.send(b"\r");
+    tui.read_through("Replace VPN profile? [y/N]");
+    assert!(!called.exists());
+    tui.send(b"\r");
+    tui.read_through("Replace canceled");
+    assert!(!called.exists());
+    assert_eq!(fs::read(&destination).unwrap(), b"");
+
+    tui.send(b"\r");
+    tui.read_through("Replace VPN profile? [y/N]");
+    tui.send(b"y");
+    tui.read_through("VPN profile — Set");
+    tui.read_through("Restored");
+    assert_private_file(&destination, b"synthetic-fnox\n");
+    assert!(!String::from_utf8_lossy(&tui.output).contains("synthetic-fnox"));
+    tui.send(b"q");
+    assert!(tui.child.wait().unwrap().success());
 }
 
 fn terminal() -> (File, File) {

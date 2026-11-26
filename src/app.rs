@@ -1,12 +1,15 @@
 use std::fmt;
 use std::io::Read;
+use std::path::Path;
 
 use crate::config::{Config, Entry, Kind};
+use crate::fnox;
 use crate::paths::{self, Location, PathError};
 
 pub(crate) enum Action<'a> {
     Install,
     Set(&'a mut dyn Read),
+    Restore { replace: bool },
 }
 
 pub(crate) enum Status {
@@ -54,7 +57,9 @@ impl App {
     pub fn status(&self, entry: &Entry) -> Status {
         let (destination, template) = match &entry.kind {
             Kind::Template { destination, .. } => (destination, true),
-            Kind::SecretFile { destination } => (destination, false),
+            Kind::SecretFile { destination } | Kind::FnoxFile { destination, .. } => {
+                (destination, false)
+            }
             Kind::SecretField {
                 destination,
                 format,
@@ -129,6 +134,13 @@ impl App {
                     Err(error) => Err(format!("install {id:?}: {error}")),
                 }
             }
+            (
+                Action::Restore { replace },
+                Kind::FnoxFile {
+                    source,
+                    destination,
+                },
+            ) => restore_file(id, source, destination, replace),
             (Action::Set(input), kind @ (Kind::SecretFile { .. } | Kind::SecretField { .. })) => {
                 let mut bytes = Vec::new();
                 input
@@ -162,6 +174,47 @@ impl App {
             }
             (Action::Install, _) => Err(format!("install does not match entry {id:?}")),
             (Action::Set(_), _) => Err(format!("set does not match entry {id:?}")),
+            (Action::Restore { .. }, _) => Err(format!("restore does not match entry {id:?}")),
         }
     }
+}
+
+pub(crate) fn restore_destination_exists(destination: &Path) -> Result<bool, PathError> {
+    match Location::destination(destination, false).and_then(|location| location.regular_file()) {
+        Ok(_) => Ok(true),
+        Err(PathError::Missing(_)) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn restore_file(
+    id: &str,
+    source: &str,
+    destination: &Path,
+    replace: bool,
+) -> Result<&'static str, String> {
+    let write_error = |error: PathError| match error {
+        PathError::Blocked(..) => format!("restore {id:?}: Blocked: {error}"),
+        _ => format!("restore {id:?}: {error}"),
+    };
+    let needs_approval = || {
+        format!(
+            "restore {id:?}: destination already exists; confirm replacement or use --replace: {destination:?}"
+        )
+    };
+    if restore_destination_exists(destination).map_err(write_error)? && !replace {
+        return Err(needs_approval());
+    }
+    let bytes = fnox::fetch(source).map_err(|error| format!("restore {id:?}: {error}"))?;
+    let location = Location::destination(destination, true).map_err(write_error)?;
+    let locked = location.lock().map_err(write_error)?;
+    if replace {
+        locked.write_file(bytes.as_slice()).map_err(write_error)?;
+    } else if !location
+        .create_file(bytes.as_slice())
+        .map_err(write_error)?
+    {
+        return Err(needs_approval());
+    }
+    Ok("Restored")
 }

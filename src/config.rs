@@ -48,6 +48,10 @@ pub(crate) enum Kind {
         format: Format,
         key: Vec<String>,
     },
+    FnoxFile {
+        source: String,
+        destination: PathBuf,
+    },
     Login {
         command: Vec<String>,
     },
@@ -143,6 +147,18 @@ impl Config {
                 Kind::SecretFile { destination } | Kind::SecretField { destination, .. } => {
                     if entry.privileged {
                         return Err(invalid("privileged secret writes are not supported"));
+                    }
+                    destination
+                }
+                Kind::FnoxFile {
+                    source,
+                    destination,
+                } => {
+                    if entry.privileged {
+                        return Err(invalid("privileged restores are not supported"));
+                    }
+                    if source.is_empty() || source.contains('\0') {
+                        return Err(invalid("fnox source must be non-empty and contain no NUL"));
                     }
                     destination
                 }
