@@ -1,7 +1,8 @@
 [package]
 name = "secsetter"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+repository = "https://github.com/prepin/secsetter"
 
 [dependencies]
 crossterm = "0.29"
