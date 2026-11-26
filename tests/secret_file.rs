@@ -190,13 +190,16 @@ fn cli_signals_abort_a_write_waiting_for_the_directory_lock() {
             .write_all(b"replacement")
             .unwrap();
 
-        // Wait until the child enters the transaction, with the directory still locked.
+        // The transaction opens the parent once to pin it and again to lock it.
         let fds = format!("/proc/{}/fd", child.id());
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !fs::read_dir(&fds)
+        while fs::read_dir(&fds)
             .unwrap()
             .flatten()
-            .any(|fd| fs::read_link(fd.path()).is_ok_and(|path| path == parent))
+            .filter(|fd| fs::read_link(fd.path()).is_ok_and(|path| path == parent))
+            .take(2)
+            .count()
+            < 2
         {
             if Instant::now() >= deadline {
                 let _ = child.kill();
@@ -217,7 +220,9 @@ fn cli_signals_abort_a_write_waiting_for_the_directory_lock() {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        assert_failure(child.wait_with_output().unwrap(), "write interrupted");
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "signal {signal}: {output:?}");
+        assert_failure(output, "write interrupted");
         assert_eq!(fs::read(&destination).unwrap(), b"original");
         assert_eq!(fs::read_dir(parent).unwrap().count(), 1);
     }
@@ -414,7 +419,7 @@ fn tui_masks_a_paste_and_waits_for_explicit_submission() {
 
     tui.send(b"q");
     tui.read_through("\x1b[?2004l");
-    assert!(tui.child.wait().unwrap().success());
+    tui.expect_successful_exit();
     let output = String::from_utf8_lossy(&tui.output);
     assert!(!output.contains("synthetic-paste"));
     assert!(!output.contains("discard-me"));
@@ -482,7 +487,7 @@ key = ["token"]
 
     tui.send(b"q");
     tui.read_through("\x1b[?2004l");
-    assert!(tui.child.wait().unwrap().success());
+    tui.expect_successful_exit();
     let output = String::from_utf8_lossy(&tui.output);
     assert!(!output.contains("synthetic-token"));
     assert!(!output.contains("discard-me"));
@@ -516,7 +521,7 @@ fn tui_clear_requires_approval_and_removes_the_whole_file() {
     tui.read_through("Nothing");
     assert!(!config.destination().exists());
     tui.send(b"q");
-    assert!(tui.child.wait().unwrap().success());
+    tui.expect_successful_exit();
     assert_eq!(success(config.clear("token")), "Cleared\n");
 }
 
@@ -587,7 +592,7 @@ destination = "$XDG_CONFIG_HOME/secrets/token"
     assert!(!String::from_utf8_lossy(&tui.output).contains("demo-abc"));
     assert!(!String::from_utf8_lossy(&tui.output).contains("continued"));
     tui.send(b"q");
-    assert!(tui.child.wait().unwrap().success());
+    tui.expect_successful_exit();
 }
 
 #[test]
@@ -663,7 +668,7 @@ destination = "$XDG_CONFIG_HOME/secrets/token"
     tui.read_through("Installed");
     assert_eq!(fs::read_to_string(destination).unwrap(), "enabled = true\n");
     tui.send(b"q");
-    assert!(tui.child.wait().unwrap().success());
+    tui.expect_successful_exit();
 }
 
 #[test]
@@ -722,7 +727,7 @@ fn tui_confirms_first_fnox_restore_and_replacement() {
     assert_private_file(&destination, b"synthetic-fnox\n");
     assert!(!String::from_utf8_lossy(&tui.output).contains("synthetic-fnox"));
     tui.send(b"q");
-    assert!(tui.child.wait().unwrap().success());
+    tui.expect_successful_exit();
 
     fs::remove_file(&called).unwrap();
     assert_eq!(success(config.clear("profile")), "Cleared\n");
@@ -735,6 +740,8 @@ fn tui_confirms_first_fnox_restore_and_replacement() {
 fn terminal() -> (File, File) {
     let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
     fcntl_setfd(&master, FdFlags::CLOEXEC).unwrap();
+    let flags = rustix::fs::fcntl_getfl(&master).unwrap();
+    rustix::fs::fcntl_setfl(&master, flags | OFlags::NONBLOCK).unwrap();
     grantpt(&master).unwrap();
     unlockpt(&master).unwrap();
     let slave = open(
@@ -809,16 +816,40 @@ impl Tui {
                 String::from_utf8_lossy(&self.output)
             );
             let mut buffer = [0; 1024];
-            let read = self.master.read(&mut buffer).unwrap();
+            let read = match self.master.read(&mut buffer) {
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(error) => panic!("read terminal while waiting for {text:?}: {error}"),
+            };
             assert!(read > 0, "terminal closed before showing {text:?}");
             self.output.extend_from_slice(&buffer[..read]);
         }
+    }
+
+    fn expect_successful_exit(&mut self) {
+        let status = self.wait_for_exit().expect("SecSetter did not exit");
+        assert!(status.success(), "{status}");
+    }
+
+    fn wait_for_exit(&mut self) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let mut buffer = [0; 4096];
+            if let Ok(read) = self.master.read(&mut buffer) {
+                self.output.extend_from_slice(&buffer[..read]);
+            }
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        None
     }
 }
 
 impl Drop for Tui {
     fn drop(&mut self) {
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.wait_for_exit();
     }
 }
