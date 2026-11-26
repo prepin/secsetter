@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod fnox;
 mod login;
 mod paths;
 mod tui;
@@ -59,18 +60,23 @@ fn run() -> Result<(), String> {
             ));
         }
         [command, id] if command == "restore" => {
-            return reject_mismatch(command, id);
+            restore(id, false)?;
         }
         [command, id, flag] if command == "restore" && flag == "--replace" => {
-            return reject_mismatch(command, id);
+            restore(id, true)?;
         }
-        _ => return Err("usage: secsetter [list | install <id> | set <id> | login <id>]".into()),
+        _ => {
+            return Err(
+                "usage: secsetter [list | install <id> | set <id> | restore <id> [--replace] | login <id>]"
+                    .into(),
+            );
+        }
     }
     Ok(())
 }
 
-fn reject_mismatch(command: &OsStr, id: &OsStr) -> Result<(), String> {
+fn restore(id: &OsStr, replace: bool) -> Result<(), String> {
     let id = id.to_str().ok_or("entry ID must be UTF-8")?;
-    App::load()?.entry(id)?;
-    Err(format!("{command:?} does not match entry {id:?}"))
+    println!("{}", App::load()?.perform(id, Action::Restore { replace })?);
+    Ok(())
 }

@@ -10,7 +10,7 @@ use crossterm::style::Print;
 use crossterm::terminal::{self, Clear, ClearType};
 use unicode_width::UnicodeWidthChar;
 
-use crate::app::{Action, App, Status};
+use crate::app::{Action, App, Status, restore_destination_exists};
 use crate::config::{Entry, Kind};
 use crate::login;
 use screen::Screen;
@@ -23,11 +23,11 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
     let login_start = (!logins.is_empty()).then_some(entries.len());
     entries.extend(logins);
     let mut selected = 0;
-    let mut confirm = false;
+    let mut confirm = None;
     let mut notice = String::new();
     loop {
-        let prompt = if confirm {
-            format!("Install {}? [y/N]", entries[selected].label)
+        let prompt = if let Some((verb, _)) = &confirm {
+            format!("{verb} {}? [y/N]", entries[selected].label)
         } else {
             notice.clone()
         };
@@ -41,20 +41,15 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(());
         }
-        if confirm {
+        if let Some((verb, action)) = confirm.take() {
             match key.code {
                 KeyCode::Char('y' | 'Y') => {
-                    notice = match app.perform(&entries[selected].id, Action::Install) {
-                        Ok(message) => message.to_owned(),
-                        Err(error) => error,
-                    };
-                    confirm = false;
+                    notice = perform(app, &mut screen, entries[selected], action)?;
                 }
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('n' | 'N') => {
-                    confirm = false;
-                    notice = "Install canceled".into();
+                    notice = format!("{verb} canceled");
                 }
-                _ => {}
+                _ => confirm = Some((verb, action)),
             }
             continue;
         }
@@ -66,7 +61,7 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
                 if let Some(entry) = entries.get(selected) {
                     match &entry.kind {
                         Kind::Template { .. } => match app.status(entry) {
-                            Status::NotInstalled => confirm = true,
+                            Status::NotInstalled => confirm = Some(("Install", Action::Install)),
                             Status::Installed => notice = "Already installed".into(),
                             status => notice = status.to_string(),
                         },
@@ -83,6 +78,22 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
                                 None => "Set canceled".into(),
                             };
                         }
+                        Kind::FnoxFile { destination, .. } => {
+                            match restore_destination_exists(destination) {
+                                Ok(true) => {
+                                    confirm = Some(("Replace", Action::Restore { replace: true }));
+                                }
+                                Ok(false) => {
+                                    notice = perform(
+                                        app,
+                                        &mut screen,
+                                        entry,
+                                        Action::Restore { replace: false },
+                                    )?;
+                                }
+                                Err(error) => notice = error.to_string(),
+                            }
+                        }
                         Kind::Login { command } => notice = run_login(&mut screen, command)?,
                     }
                 }
@@ -90,6 +101,20 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
             _ => {}
         }
     }
+}
+
+fn perform(
+    app: &App,
+    screen: &mut Screen,
+    entry: &Entry,
+    action: Action<'_>,
+) -> io::Result<String> {
+    let result = if matches!(action, Action::Restore { .. }) {
+        screen.with_terminal(|| app.perform(&entry.id, action))?
+    } else {
+        app.perform(&entry.id, action)
+    };
+    Ok(result.map_or_else(|error| error, str::to_owned))
 }
 
 fn prompt_secret(
