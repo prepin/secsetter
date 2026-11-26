@@ -1,15 +1,15 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus};
 use std::ptr;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustix::termios::{tcgetattr, LocalModes};
+use rustix::termios::{LocalModes, tcgetattr};
 
 const LOGIN: &str = r#"
 [[entries]]
@@ -330,13 +330,9 @@ fn cli_runs_in_the_current_terminal_and_preserves_interrupt_status() {
     let config = ConfigDir::new(INTERACTIVE_LOGIN);
     let mut command = config.command();
     command.args(["login", "demo"]);
-    eprintln!("Launching CLI terminal fixture");
     let mut pty = Terminal::launch(command);
-    eprintln!("Waiting for CLI login prompt");
     pty.expect("Synthetic prompt: ");
-    eprintln!("Sending terminal Ctrl+C");
     pty.send(b"\x03");
-    eprintln!("Waiting for interrupted CLI to exit");
     assert_eq!(pty.wait().signal(), Some(libc::SIGINT));
 }
 
@@ -474,7 +470,6 @@ impl Terminal {
             },
             0
         );
-        eprintln!("Opened pseudo-terminal");
         // SAFETY: The successful openpty call returned owned descriptors.
         let (master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
         for fd in [&master, &slave] {
@@ -495,11 +490,8 @@ impl Terminal {
                 Ok(())
             });
         }
-        eprintln!("Spawning SecSetter");
-        let child = command.spawn().unwrap();
-        eprintln!("Spawned SecSetter (PID {})", child.id());
         Self {
-            child,
+            child: command.spawn().unwrap(),
             master,
             slave,
             unread: Vec::new(),
@@ -559,24 +551,29 @@ impl Terminal {
     }
 
     fn wait(&mut self) -> ExitStatus {
+        self.wait_for_exit().expect("SecSetter did not exit")
+    }
+
+    fn wait_for_exit(&mut self) -> Option<ExitStatus> {
         let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
+        while Instant::now() < deadline {
             if let Some(status) = self.child.try_wait().unwrap() {
-                return status;
+                return Some(status);
             }
-            assert!(Instant::now() < deadline, "SecSetter did not exit");
+            // macOS drains the controlling terminal before the session leader can exit.
+            let _ = self.master.read(&mut [0; 4096]);
             thread::sleep(Duration::from_millis(10));
         }
+        None
     }
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
         if matches!(self.child.try_wait(), Ok(None)) {
-            eprintln!("Stopping hung SecSetter fixture (PID {})", self.child.id());
             // SAFETY: The live child started a fresh session and process group.
             unsafe { libc::killpg(self.child.id() as i32, libc::SIGKILL) };
-            let _ = self.child.wait();
+            let _ = self.wait_for_exit();
         }
     }
 }
