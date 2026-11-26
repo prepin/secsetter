@@ -475,6 +475,8 @@ impl Terminal {
         for fd in [&master, &slave] {
             rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC).unwrap();
         }
+        let flags = rustix::fs::fcntl_getfl(&master).unwrap();
+        rustix::fs::fcntl_setfl(&master, flags | rustix::fs::OFlags::NONBLOCK).unwrap();
         command
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
@@ -521,7 +523,18 @@ impl Terminal {
                 String::from_utf8_lossy(&self.unread)
             );
             let mut chunk = [0; 4096];
-            let count = self.master.read(&mut chunk).unwrap();
+            let count = match self.master.read(&mut chunk) {
+                Ok(count) => count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => panic!("read terminal while waiting for {text:?}: {error}"),
+            };
             assert!(count > 0, "terminal closed before {text:?}");
             self.unread.extend_from_slice(&chunk[..count]);
         }
