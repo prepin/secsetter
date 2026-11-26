@@ -371,7 +371,12 @@ fn tui_masks_a_paste_and_waits_for_explicit_submission() {
 
     tui.read_through("○ Not set");
     tui.send(b"\r");
-    tui.read_through("Enter submit   Esc cancel");
+    tui.read_through("\x1b[8;20H");
+    tui.read_through("Set secret");
+    tui.read_through("Token file");
+    tui.read_through("Destination:");
+    tui.read_through("Paste or type a secret");
+    tui.read_through("Enter submit   Esc cancel   Ctrl+J newline");
 
     // Both kinds of newline, Ctrl-C, and an escape sequence belong to the value.
     let pasted = "  synthetic-paste\r\nq\x03\x1b[A café\n";
@@ -386,6 +391,7 @@ fn tui_masks_a_paste_and_waits_for_explicit_submission() {
     assert_private_file(&destination, pasted.as_bytes());
 
     tui.send(b"\r");
+    tui.read_through("Replace secret");
     tui.read_through("Enter submit   Esc cancel");
     tui.send(b"\x1b[200~discard-me\x1b[201~");
     tui.read_through("**********");
@@ -438,7 +444,7 @@ key = ["token"]
     tui.send(b"\r");
     tui.read_through("Enter submit   Esc cancel");
     tui.send(b"\x1b[200~new-synthetic-token\n\x1b[201~");
-    tui.read_through("********************");
+    tui.read_through("*******************");
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
     tui.send(b"\r");
     tui.read_through("Set");
@@ -487,12 +493,27 @@ destination = "$XDG_CONFIG_HOME/secrets/token"
     tui.read_through("Enter submit   Esc cancel");
     tui.send(b"\x1b[200~demo-abc\x1b[201~");
     tui.read_through("********");
+    tui.send(b"\n\x1b[200~continued\x1b[201~");
+    tui.read_through("*********");
+    assert!(!config.destination().exists());
+
+    tui.resize(160, 45);
+    tui.read_through("\x1b[18;31H");
+    tui.read_through("Set secret");
+    tui.read_through("Destination:");
+    tui.read_through("********");
+    tui.read_through("*********");
+    tui.read_through("Enter submit   Esc cancel");
 
     tui.resize(32, 8);
     tui.read_through("› Long token…");
-    tui.read_through("○ Not set");
-    tui.read_through("********");
-    tui.read_through("Enter submit   Esc cancel");
+    tui.read_through("○");
+    tui.read_through("Not");
+    tui.read_through("set");
+    tui.read_through("\x1b[3;2H");
+    tui.read_through("Set secret");
+    tui.read_through("*********");
+    tui.read_through("Enter OK  Ctrl+J line  Esc");
 
     tui.resize(24, 7);
     tui.read_through("Resize to 32×8");
@@ -502,14 +523,69 @@ destination = "$XDG_CONFIG_HOME/secrets/token"
     assert!(!config.destination().exists());
 
     tui.resize(100, 24);
-    tui.read_through("Selected entry");
+    tui.read_through("Selected");
+    tui.read_through("entry");
     tui.read_through("********");
+    tui.read_through("*********");
     tui.read_through("Enter submit   Esc cancel");
     tui.send(b"\r");
     tui.read_through("✓ Set");
-    assert_private_file(&config.destination(), b"demo-abc");
+    assert_private_file(&config.destination(), b"demo-abc\ncontinued");
     assert!(!config.root.join("secrets/other").exists());
     assert!(!String::from_utf8_lossy(&tui.output).contains("demo-abc"));
+    assert!(!String::from_utf8_lossy(&tui.output).contains("continued"));
+    tui.send(b"q");
+    assert!(tui.child.wait().unwrap().success());
+}
+
+#[test]
+fn tui_install_buttons_preserve_focus_on_resize_and_default_to_install() {
+    let config = Fixture::with_config(
+        r#"
+[[entries]]
+id = "template"
+label = "Example config"
+kind = "template"
+source = "example.toml"
+destination = "$XDG_CONFIG_HOME/secrets/token"
+"#,
+    );
+    let templates = config.root.join("secsetter/templates");
+    fs::create_dir(&templates).unwrap();
+    fs::write(templates.join("example.toml"), "enabled = true\n").unwrap();
+    let destination = config.destination();
+    let mut tui = config.open_tui();
+    tui.read_through("○ Not installed");
+
+    tui.send(b"\r");
+    tui.read_through("Install config?");
+    tui.read_through("Destination");
+    tui.read_through("[ Install ]");
+    tui.read_through("[ Cancel ]");
+    assert!(!destination.exists());
+
+    tui.send(b"\t");
+    tui.resize(32, 10);
+    tui.read_through("Install config?");
+    tui.read_through("…/token");
+    tui.read_through("[Install]");
+    tui.read_through("›");
+    tui.read_through("[Cancel]");
+    tui.resize(32, 8);
+    tui.read_through("Install config?");
+    tui.read_through("[Install]");
+    tui.read_through("›");
+    tui.read_through("[Cancel]");
+    tui.send(b"\r");
+    tui.read_through("canceled");
+    assert!(!destination.exists());
+
+    tui.send(b"\r");
+    tui.read_through("›");
+    tui.read_through("[Install]");
+    tui.send(b"\r");
+    tui.read_through("✓ Installed");
+    assert_eq!(fs::read_to_string(destination).unwrap(), "enabled = true\n");
     tui.send(b"q");
     assert!(tui.child.wait().unwrap().success());
 }
@@ -530,18 +606,19 @@ fn tui_restores_a_missing_file_and_asks_before_replacing_an_empty_file() {
     fs::write(&destination, b"").unwrap();
     fs::remove_file(&called).unwrap();
     tui.send(b"\r");
-    tui.read_through("Replace VPN profile?");
-    tui.read_through("[y/N]");
+    tui.read_through("Replace from fnox?");
+    tui.read_through("[ Replace ]");
+    tui.read_through("[ Cancel ]");
     assert!(!called.exists());
-    tui.send(b"\r");
+    tui.send(b"\x1b[C\r");
     tui.read_through("canceled");
     assert!(!called.exists());
     assert_eq!(fs::read(&destination).unwrap(), b"");
 
     tui.send(b"\r");
-    tui.read_through("Replace VPN profile?");
-    tui.read_through("[y/N]");
-    tui.send(b"y");
+    tui.read_through("Replace from fnox?");
+    tui.read_through("[ Replace ]");
+    tui.send(b"\x1b[C\x1b[D\r");
     tui.read_through("✓ Set");
     tui.read_through("Restored");
     assert_private_file(&destination, b"synthetic-fnox\n");

@@ -12,6 +12,22 @@ use crate::login;
 use screen::Screen;
 use view::{Panel, View};
 
+struct Confirmation {
+    verb: &'static str,
+    action: Action<'static>,
+    cancel_selected: bool,
+}
+
+impl Confirmation {
+    fn new(verb: &'static str, action: Action<'static>) -> Self {
+        Self {
+            verb,
+            action,
+            cancel_selected: false,
+        }
+    }
+}
+
 pub(crate) fn run(app: &App) -> io::Result<()> {
     let mut screen = Screen::enter()?;
     let (mut entries, logins): (Vec<_>, Vec<_>) = app
@@ -20,7 +36,7 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
     let login_start = (!logins.is_empty()).then_some(entries.len());
     entries.extend(logins);
     let mut selected = 0;
-    let mut confirm: Option<(&str, Action<'_>)> = None;
+    let mut confirm: Option<Confirmation> = None;
     let mut notice = String::new();
     loop {
         let view = View {
@@ -30,14 +46,19 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
             selected,
         };
         let panel = match &confirm {
-            Some((verb, _)) => Panel::Confirm(verb),
+            Some(confirm) => Panel::Confirm {
+                verb: confirm.verb,
+                cancel_selected: confirm.cancel_selected,
+            },
             None => Panel::Notice(&notice),
         };
         let usable = screen.draw(|frame| view.render(frame, panel))?;
         let Event::Key(key) = event::read()? else {
             continue;
         };
-        if key.kind == KeyEventKind::Release {
+        if key.kind == KeyEventKind::Release
+            || (key.code == KeyCode::Enter && key.kind == KeyEventKind::Repeat)
+        {
             continue;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -50,16 +71,27 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
                 _ => continue,
             }
         }
-        if let Some((verb, action)) = confirm.take() {
-            match key.code {
-                KeyCode::Char('y' | 'Y') => {
-                    notice = perform(app, &mut screen, entries[selected], action)?;
+        if let Some(mut pending) = confirm.take() {
+            let approve = match key.code {
+                KeyCode::Char('y' | 'Y') => true,
+                KeyCode::Enter => !pending.cancel_selected,
+                KeyCode::Esc | KeyCode::Char('n' | 'N') => false,
+                _ => {
+                    pending.cancel_selected = match key.code {
+                        KeyCode::Left => false,
+                        KeyCode::Right => true,
+                        KeyCode::Tab | KeyCode::BackTab => !pending.cancel_selected,
+                        _ => pending.cancel_selected,
+                    };
+                    confirm = Some(pending);
+                    continue;
                 }
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('n' | 'N') => {
-                    notice = format!("{verb} canceled");
-                }
-                _ => confirm = Some((verb, action)),
-            }
+            };
+            notice = if approve {
+                perform(app, &mut screen, entries[selected], pending.action)?
+            } else {
+                format!("{} canceled", pending.verb)
+            };
             continue;
         }
         match key.code {
@@ -79,9 +111,11 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
                 if let Some(entry) = entries.get(selected) {
                     match &entry.kind {
                         Kind::Template { .. } => match app.status(entry) {
-                            Status::NotInstalled => confirm = Some(("Install", Action::Install)),
+                            Status::NotInstalled => {
+                                confirm = Some(Confirmation::new("Install", Action::Install));
+                            }
                             Status::Unknown(_) if entry.ownership().is_some() => {
-                                confirm = Some(("Install", Action::Install));
+                                confirm = Some(Confirmation::new("Install", Action::Install));
                             }
                             Status::Installed => notice = "Already installed".into(),
                             status => notice = status.to_string(),
@@ -100,10 +134,13 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
                         Kind::FnoxFile { destination, .. } => {
                             match restore_destination(entry, destination) {
                                 Ok(RestoreDestination::Present) => {
-                                    confirm = Some(("Replace", Action::Restore { replace: true }));
+                                    confirm = Some(Confirmation::new(
+                                        "Replace",
+                                        Action::Restore { replace: true },
+                                    ));
                                 }
                                 Ok(RestoreDestination::RequiresElevation) => {
-                                    confirm = Some((
+                                    confirm = Some(Confirmation::new(
                                         "Restore or replace",
                                         Action::Restore { replace: true },
                                     ));
@@ -146,14 +183,33 @@ fn prompt_secret(screen: &mut Screen, view: &View<'_>) -> io::Result<Option<Stri
     let mut secret = String::new();
     loop {
         let usable = screen.draw(|frame| {
-            let count = secret.chars().take(usize::from(frame.area().width)).count();
-            view.render(frame, Panel::Secret(count))
+            let counts: Vec<_> = secret
+                .rsplit('\n')
+                .take(usize::from(frame.area().height))
+                .enumerate()
+                .map(|(index, line)| {
+                    let line = if index == 0 {
+                        line
+                    } else {
+                        line.strip_suffix('\r').unwrap_or(line)
+                    };
+                    line.chars().count()
+                })
+                .collect();
+            view.render(frame, Panel::Secret(&counts))
         })?;
         match event::read()? {
             Event::Paste(text) if usable => secret.push_str(&text),
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     return Ok(None);
+                }
+                if usable
+                    && key.code == KeyCode::Char('j')
+                    && key.modifiers == KeyModifiers::CONTROL
+                {
+                    secret.push('\n');
+                    continue;
                 }
                 if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
                     continue;
@@ -163,7 +219,9 @@ fn prompt_secret(screen: &mut Screen, view: &View<'_>) -> io::Result<Option<Stri
                     _ if !usable => {}
                     KeyCode::Enter => return Ok(Some(secret)),
                     KeyCode::Backspace => {
-                        secret.pop();
+                        if secret.pop() == Some('\n') && secret.ends_with('\r') {
+                            secret.pop();
+                        }
                     }
                     KeyCode::Char(character) => secret.push(character),
                     KeyCode::Tab => secret.push('\t'),
