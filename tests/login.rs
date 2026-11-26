@@ -330,8 +330,10 @@ fn tui_stops_on_ctrl_c_even_if_the_step_exits_successfully_and_restores_terminal
     pty.expect("Synthetic prompt: ");
     let restored_modes = tcgetattr(&pty.slave).unwrap().local_modes;
     assert!(restored_modes.contains(LocalModes::ECHO | LocalModes::ICANON | LocalModes::ISIG));
-    pty.send(b"\x03");
-    pty.expect("interrupted");
+    pty.send(b"synthetic answer\n");
+    pty.expect("Next prompt: ");
+    pty.send(b"second answer\n");
+    pty.expect("completed");
     pty.quit();
 }
 
