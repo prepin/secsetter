@@ -11,6 +11,7 @@ use crate::secret_field::{Format, validate_key};
 pub(crate) enum FileWrite {
     Create,
     Replace,
+    ReplaceTemplate,
     Field { format: Format, key: Vec<String> },
     Remove,
 }
@@ -42,7 +43,10 @@ impl FileWrite {
             WriteInterrupts::start().map_err(|error| format!("set up interruption: {error}"))?;
         let location = match ownership {
             Some(ownership) => Location::privileged(path, ownership),
-            None => Location::destination(path, matches!(self, Self::Create | Self::Replace)),
+            None => Location::destination(
+                path,
+                matches!(self, Self::Create | Self::Replace | Self::ReplaceTemplate),
+            ),
         };
         let location = match location {
             Ok(location) => location,
@@ -56,7 +60,7 @@ impl FileWrite {
                     return Ok(Outcome::AlreadyExists);
                 }
             }
-            Self::Replace => location
+            Self::Replace | Self::ReplaceTemplate => location
                 .lock()
                 .and_then(|locked| locked.write_file(bytes))
                 .map_err(PathError::for_write)?,

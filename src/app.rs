@@ -9,7 +9,7 @@ use crate::paths::{self, Location, PathError};
 use crate::privileged;
 
 pub(crate) enum Action<'a> {
-    Install,
+    Install { replace: bool },
     Set(&'a mut dyn Read),
     Restore { replace: bool },
     Clear,
@@ -115,34 +115,28 @@ impl App {
         let entry = self.entry(id)?;
         match (action, &entry.kind) {
             (
-                Action::Install,
+                Action::Install { replace },
                 Kind::Template {
                     source,
                     destination,
                 },
             ) => {
-                match self.status(entry) {
-                    Status::Installed => return Ok("Already installed"),
-                    Status::NotInstalled => {}
-                    Status::Unknown(_) if entry.ownership().is_some() => {}
-                    Status::Blocked(error) => {
-                        return Err(format!("install {id:?}: Blocked: {error}"));
-                    }
-                    Status::Unknown(error) => return Err(format!("install {id:?}: {error}")),
-                    _ => unreachable!("template has a template status"),
-                }
-                let error = |error: String| format!("install {id:?}: {error}");
-                let mut input =
-                    paths::open_template(&self.config.directory, &self.config.path, source)
-                        .map_err(|cause| error(cause.to_string()))?;
-                let mut bytes = Vec::new();
-                input
-                    .read_to_end(&mut bytes)
-                    .map_err(|cause| error(format!("read template {source:?}: {cause}")))?;
-                match write(entry, destination, FileWrite::Create, &bytes).map_err(error)? {
-                    Outcome::Written => Ok("Installed"),
-                    Outcome::AlreadyExists => Ok("Already installed"),
-                }
+                let operation = if replace {
+                    FileWrite::ReplaceTemplate
+                } else {
+                    FileWrite::Create
+                };
+                write_from_source(entry, destination, operation, "install", || {
+                    let mut input =
+                        paths::open_template(&self.config.directory, &self.config.path, source)
+                            .map_err(|error| error.to_string())?;
+                    let mut bytes = Vec::new();
+                    input
+                        .read_to_end(&mut bytes)
+                        .map_err(|error| format!("read template {source:?}: {error}"))?;
+                    Ok(bytes)
+                })?;
+                Ok("Installed")
             }
             (
                 Action::Restore { replace },
@@ -150,7 +144,17 @@ impl App {
                     source,
                     destination,
                 },
-            ) => restore_file(entry, source, destination, replace),
+            ) => {
+                let operation = if replace {
+                    FileWrite::Replace
+                } else {
+                    FileWrite::Create
+                };
+                write_from_source(entry, destination, operation, "restore", || {
+                    fnox::fetch(source)
+                })?;
+                Ok("Restored")
+            }
             (Action::Set(input), kind @ (Kind::SecretFile { .. } | Kind::SecretField { .. })) => {
                 let mut bytes = Vec::new();
                 input
@@ -200,7 +204,7 @@ impl App {
                     .map_err(|error| format!("clear {id:?}: {error}"))?;
                 Ok("Cleared")
             }
-            (Action::Install, _) => Err(format!("install does not match entry {id:?}")),
+            (Action::Install { .. }, _) => Err(format!("install does not match entry {id:?}")),
             (Action::Set(_), _) => Err(format!("set does not match entry {id:?}")),
             (Action::Restore { .. }, _) => Err(format!("restore does not match entry {id:?}")),
         }
@@ -231,56 +235,51 @@ fn login_status(checks: &[LoginCheck]) -> Status {
     unknown.map_or(Status::LoginConfigured, Status::Unknown)
 }
 
-pub(crate) enum RestoreDestination {
+pub(crate) enum CopyDestination {
     Present,
     Missing,
     RequiresElevation,
 }
 
-pub(crate) fn restore_destination(
+pub(crate) fn copy_destination(
     entry: &Entry,
     destination: &Path,
-) -> Result<RestoreDestination, PathError> {
+) -> Result<CopyDestination, PathError> {
     match Location::destination(destination, false).and_then(|location| location.regular_file()) {
-        Ok(_) => Ok(RestoreDestination::Present),
-        Err(PathError::Missing(_)) => Ok(RestoreDestination::Missing),
+        Ok(_) => Ok(CopyDestination::Present),
+        Err(PathError::Missing(_)) => Ok(CopyDestination::Missing),
         Err(PathError::Io(..)) if entry.ownership().is_some() => {
-            Ok(RestoreDestination::RequiresElevation)
+            Ok(CopyDestination::RequiresElevation)
         }
         Err(error) => Err(error),
     }
 }
 
-fn restore_file(
+fn write_from_source(
     entry: &Entry,
-    source: &str,
     destination: &Path,
-    replace: bool,
-) -> Result<&'static str, String> {
+    operation: FileWrite,
+    command: &str,
+    read: impl FnOnce() -> Result<Vec<u8>, String>,
+) -> Result<(), String> {
     let id = &entry.id;
-    let restore_error = |error: String| format!("restore {id:?}: {error}");
+    let action_error = |error: String| format!("{command} {id:?}: {error}");
     let needs_approval = || {
         format!(
-            "restore {id:?}: destination already exists; confirm replacement or use --replace: {destination:?}"
+            "{command} {id:?}: destination already exists; confirm replacement or use --replace: {destination:?}"
         )
     };
-    let state = restore_destination(entry, destination)
-        .map_err(|error| restore_error(error.for_write()))?;
-    if matches!(state, RestoreDestination::Present) && !replace {
+    let state =
+        copy_destination(entry, destination).map_err(|error| action_error(error.for_write()))?;
+    if matches!(state, CopyDestination::Present) && matches!(operation, FileWrite::Create) {
         return Err(needs_approval());
     }
-    let bytes = fnox::fetch(source).map_err(restore_error)?;
-    let operation = if replace {
-        FileWrite::Replace
-    } else {
-        FileWrite::Create
-    };
-    if write(entry, destination, operation, &bytes).map_err(restore_error)?
-        == Outcome::AlreadyExists
+    let bytes = read().map_err(action_error)?;
+    if write(entry, destination, operation, &bytes).map_err(action_error)? == Outcome::AlreadyExists
     {
         return Err(needs_approval());
     }
-    Ok("Restored")
+    Ok(())
 }
 
 fn write(

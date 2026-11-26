@@ -200,8 +200,11 @@ fn public_commands_write_declared_destinations_through_the_root_helper() {
     let document: toml::Value = toml::from_str(str::from_utf8(&edited).unwrap()).unwrap();
     assert_eq!(document["token"].as_str(), Some("new\n"));
     assert!(edited.ends_with(b"# keep\n"));
-    success(run(&["install", "template"], None));
+    failure(run(&["install", "template"], None), "--replace");
     assert_root_file(&installed, &edited);
+    fs::write(templates.join("config.toml"), b"token = 'reset'\n# keep\n").unwrap();
+    success(run(&["install", "template", "--replace"], None));
+    assert_root_file(&installed, b"token = 'reset'\n# keep\n");
 
     success(run(&["set", "token"], Some(b"first")));
     success(run(&["set", "token"], Some(b"replacement\0\r\n")));

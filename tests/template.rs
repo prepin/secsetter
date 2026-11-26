@@ -47,7 +47,7 @@ fn stdout(output: Output) -> String {
 }
 
 #[test]
-fn installs_a_missing_template_and_preserves_an_installed_destination() {
+fn installs_a_missing_template_and_requires_replace_to_reinstall() {
     use std::os::unix::fs::PermissionsExt;
 
     let config = ConfigDir::new(WIDGET);
@@ -72,9 +72,22 @@ fn installs_a_missing_template_and_preserves_an_installed_destination() {
     assert!(stdout(config.run(&["list"])).contains("Installed"));
 
     fs::write(&destination, b"local config").unwrap();
-    fs::remove_file(config.root.join("secsetter/templates/widget.json")).unwrap();
-    assert!(stdout(config.run(&["install", "vpn-widget"])).contains("installed"));
-    assert_eq!(fs::read(destination).unwrap(), b"local config");
+    let template = config.root.join("secsetter/templates/widget.json");
+    fs::remove_file(&template).unwrap();
+    fails(config.run(&["install", "vpn-widget"]), "--replace");
+    fails(
+        config.run(&["install", "vpn-widget", "--replace"]),
+        "widget.json",
+    );
+    assert_eq!(fs::read(&destination).unwrap(), b"local config");
+
+    fs::write(template, b"").unwrap();
+    stdout(config.run(&["install", "vpn-widget", "--replace"]));
+    assert!(fs::read(&destination).unwrap().is_empty());
+    assert_eq!(
+        fs::metadata(destination).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }
 
 #[test]

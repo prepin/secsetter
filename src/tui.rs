@@ -5,7 +5,7 @@ use std::io;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
-use crate::app::{Action, App, RestoreDestination, Status, restore_destination};
+use crate::app::{Action, App, CopyDestination, Status, copy_destination};
 use crate::config::{Entry, Kind};
 use crate::login;
 use screen::Screen;
@@ -121,16 +121,35 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
             KeyCode::Enter => {
                 if let Some(entry) = entries.get(selected) {
                     match &entry.kind {
-                        Kind::Template { .. } => match app.status(entry) {
-                            Status::NotInstalled => {
-                                confirm = Some(Confirmation::new("Install", Action::Install));
+                        kind @ (Kind::Template { destination, .. }
+                        | Kind::FnoxFile { destination, .. }) => {
+                            match copy_destination(entry, destination) {
+                                Ok(state) => {
+                                    let replace = !matches!(state, CopyDestination::Missing);
+                                    let (verb, action) = if matches!(kind, Kind::Template { .. }) {
+                                        let verb = match state {
+                                            CopyDestination::Missing => "Install",
+                                            CopyDestination::Present => "Reinstall",
+                                            CopyDestination::RequiresElevation => {
+                                                "Install or replace"
+                                            }
+                                        };
+                                        (verb, Action::Install { replace })
+                                    } else {
+                                        let verb = match state {
+                                            CopyDestination::Missing => "Restore",
+                                            CopyDestination::Present => "Replace",
+                                            CopyDestination::RequiresElevation => {
+                                                "Restore or replace"
+                                            }
+                                        };
+                                        (verb, Action::Restore { replace })
+                                    };
+                                    confirm = Some(Confirmation::new(verb, action));
+                                }
+                                Err(error) => notice = error.for_write(),
                             }
-                            Status::Unknown(_) if entry.ownership().is_some() => {
-                                confirm = Some(Confirmation::new("Install", Action::Install));
-                            }
-                            Status::Installed => notice = "Already installed".into(),
-                            status => notice = status.to_string(),
-                        },
+                        }
                         Kind::SecretFile { .. } | Kind::SecretField { .. } => {
                             notice = match prompt_secret(&mut screen, &view)? {
                                 Some(secret) => perform(
@@ -141,31 +160,6 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
                                 )?,
                                 None => "Set canceled".into(),
                             };
-                        }
-                        Kind::FnoxFile { destination, .. } => {
-                            match restore_destination(entry, destination) {
-                                Ok(RestoreDestination::Present) => {
-                                    confirm = Some(Confirmation::new(
-                                        "Replace",
-                                        Action::Restore { replace: true },
-                                    ));
-                                }
-                                Ok(RestoreDestination::RequiresElevation) => {
-                                    confirm = Some(Confirmation::new(
-                                        "Restore or replace",
-                                        Action::Restore { replace: true },
-                                    ));
-                                }
-                                Ok(RestoreDestination::Missing) => {
-                                    notice = perform(
-                                        app,
-                                        &mut screen,
-                                        entry,
-                                        Action::Restore { replace: false },
-                                    )?;
-                                }
-                                Err(error) => notice = error.to_string(),
-                            }
                         }
                         Kind::Login { commands, .. } => {
                             let result = screen.with_terminal(

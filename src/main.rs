@@ -56,10 +56,6 @@ fn run() -> Result<ExitCode, String> {
                 }
             }
         }
-        [command, id] if command == "install" => {
-            let id = id.to_str().ok_or("entry ID must be UTF-8")?;
-            println!("{}", App::load(config_path)?.perform(id, Action::Install)?);
-        }
         [command, id] if command == "set" => {
             let id = id.to_str().ok_or("entry ID must be UTF-8")?;
             let stdin = io::stdin();
@@ -89,11 +85,13 @@ fn run() -> Result<ExitCode, String> {
                 return Ok(failure.exit_code());
             }
         }
-        [command, id] if command == "restore" => {
-            restore(config_path, id, false)?;
+        [command, id] if command == "install" || command == "restore" => {
+            copy_file(config_path, command, id, false)?;
         }
-        [command, id, flag] if command == "restore" && flag == "--replace" => {
-            restore(config_path, id, true)?;
+        [command, id, flag]
+            if (command == "install" || command == "restore") && flag == "--replace" =>
+        {
+            copy_file(config_path, command, id, true)?;
         }
         _ => {
             return Err(format!(
@@ -105,11 +103,18 @@ fn run() -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn restore(config_path: Option<&Path>, id: &OsStr, replace: bool) -> Result<(), String> {
+fn copy_file(
+    config_path: Option<&Path>,
+    command: &OsStr,
+    id: &OsStr,
+    replace: bool,
+) -> Result<(), String> {
     let id = id.to_str().ok_or("entry ID must be UTF-8")?;
-    println!(
-        "{}",
-        App::load(config_path)?.perform(id, Action::Restore { replace })?
-    );
+    let action = if command == "install" {
+        Action::Install { replace }
+    } else {
+        Action::Restore { replace }
+    };
+    println!("{}", App::load(config_path)?.perform(id, action)?);
     Ok(())
 }

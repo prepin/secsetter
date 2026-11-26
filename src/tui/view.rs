@@ -252,7 +252,7 @@ fn render_details(frame: &mut Frame, area: Rect, entry: &Entry, status: &Status)
         Kind::Template { destination, .. } => (
             Some(destination),
             if matches!(status, Status::Installed) {
-                "Already installed"
+                "Enter to reinstall"
             } else {
                 "Enter to install"
             },
@@ -379,6 +379,9 @@ fn render_confirmation(
 ) {
     let title = match verb {
         "Install" => " Install config? ",
+        "Reinstall" => " Reinstall from template? ",
+        "Install or replace" => " Install or replace? ",
+        "Restore" => " Restore from fnox? ",
         "Replace" => " Replace from fnox? ",
         "Clear" if matches!(entry.kind, Kind::SecretField { .. }) => " Empty this field? ",
         "Clear" => " Remove this file? ",
@@ -411,7 +414,7 @@ fn render_confirmation(
     frame.render_widget(Paragraph::new(description).wrap(WRAP), details);
 
     let compact = width < 36;
-    let label = if compact && verb == "Restore or replace" {
+    let label = if compact && matches!(verb, "Install or replace" | "Restore or replace") {
         "Proceed"
     } else {
         verb

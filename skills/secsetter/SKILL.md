@@ -25,7 +25,7 @@ Validation reads only the config and checks entries for all platforms. It does n
 Copy the entries that match the task. Replace example IDs, paths, keys, and commands with the actual values.
 
 ```toml
-# Install a non-secret template only if the destination is missing.
+# Install a non-secret template or replace the destination with it.
 [[entries]]
 id = "example-config"
 label = "Example config"

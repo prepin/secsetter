@@ -591,7 +591,7 @@ destination = "$XDG_CONFIG_HOME/secrets/token"
 }
 
 #[test]
-fn tui_install_buttons_preserve_focus_on_resize_and_default_to_install() {
+fn tui_confirms_install_and_reinstall_and_preserves_focus_on_resize() {
     let config = Fixture::with_config(
         r#"
 [[entries]]
@@ -640,13 +640,34 @@ destination = "$XDG_CONFIG_HOME/secrets/token"
     tui.read_through("[Install]");
     tui.send(b"\r");
     tui.read_through("✓ Installed");
+    assert_eq!(
+        fs::read_to_string(&destination).unwrap(),
+        "enabled = true\n"
+    );
+
+    fs::write(&destination, "enabled = false\n").unwrap();
+    tui.send(b"\r");
+    tui.read_through("Reinstall from template?");
+    tui.read_through("[Cancel]");
+    tui.send(b"n");
+    tui.read_through("canceled");
+    assert_eq!(
+        fs::read_to_string(&destination).unwrap(),
+        "enabled = false\n"
+    );
+
+    tui.send(b"\r");
+    tui.read_through("Reinstall from template?");
+    tui.read_through("[Reinstall]");
+    tui.send(b"\r");
+    tui.read_through("Installed");
     assert_eq!(fs::read_to_string(destination).unwrap(), "enabled = true\n");
     tui.send(b"q");
     assert!(tui.child.wait().unwrap().success());
 }
 
 #[test]
-fn tui_restores_a_missing_file_and_asks_before_replacing_an_empty_file() {
+fn tui_confirms_first_fnox_restore_and_replacement() {
     let config = Fixture::with_config(FNOX_CONFIG);
     config.fnox_stub(r#"printf 'synthetic-fnox\n'"#);
     let destination = config.destination();
@@ -654,6 +675,28 @@ fn tui_restores_a_missing_file_and_asks_before_replacing_an_empty_file() {
     let mut tui = config.open_tui();
 
     tui.read_through("○ Not set");
+    tui.send(b"\r");
+    tui.read_through("Restore from fnox?");
+    tui.read_through("[ Restore ]");
+    assert!(!called.exists() && !destination.exists());
+    tui.send(b"n");
+    tui.read_through("canceled");
+    assert!(!called.exists() && !destination.exists());
+
+    tui.send(b"\r");
+    tui.read_through("Restore from fnox?");
+    tui.read_through("[ Restore ]");
+    fs::create_dir(destination.parent().unwrap()).unwrap();
+    fs::write(&destination, b"new local file").unwrap();
+    tui.send(b"\r");
+    tui.read_through("exists;");
+    assert!(!called.exists());
+    assert_eq!(fs::read(&destination).unwrap(), b"new local file");
+    fs::remove_file(&destination).unwrap();
+
+    tui.send(b"\r");
+    tui.read_through("Restore from fnox?");
+    tui.read_through("[ Restore ]");
     tui.send(b"\r");
     tui.read_through("Restored");
     assert_private_file(&destination, b"synthetic-fnox\n");

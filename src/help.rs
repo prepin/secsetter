@@ -18,7 +18,7 @@ Options:
 Commands:
   validate                 Validate the config without running any actions.
   list                     List applicable entries and their local status.
-  install <id>             Install a template at a missing destination.
+  install <id> [--replace]  Install a template.
   set <id>                 Write a secret from standard input.
   clear <id>               Clear a secret field or remove a local secret file.
   restore <id> [--replace]  Restore a file from fnox.
@@ -50,9 +50,10 @@ For config examples, run 'secsetter skill'.",
 Login actions without readiness checks omit the status column.",
         ),
         Some("install") => (
-            "install <id>",
+            "install <id> [--replace]",
             "Install the template identified by <id>. The source is relative to
-templates/ beside the config file. An existing destination is left intact.",
+templates/ beside the config file.
+  --replace  Allow replacement of an existing destination.",
         ),
         Some("set") => (
             "set <id>",

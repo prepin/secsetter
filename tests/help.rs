@@ -35,7 +35,7 @@ fn help_is_available_without_a_config() {
     for (name, syntax) in [
         ("validate", "validate"),
         ("list", "list"),
-        ("install", "install <id>"),
+        ("install", "install <id> [--replace]"),
         ("set", "set <id>"),
         ("clear", "clear <id>"),
         ("restore", "restore <id> [--replace]"),
