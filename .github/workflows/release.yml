@@ -31,7 +31,15 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup update stable --no-self-update
-      - run: cargo +stable test --locked --target "$TARGET"
+      - name: Run tests
+        shell: bash
+        run: |
+          # Run terminal fixtures one at a time on macOS.
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            export RUST_TEST_THREADS=1
+          fi
+          cargo +stable test --locked --target "$TARGET"
+        timeout-minutes: 4
       - run: cargo +stable build --release --locked --target "$TARGET"
       - name: Smoke-test and package the binary
         shell: bash
