@@ -9,6 +9,7 @@ mod secret_field;
 mod tui;
 
 use std::io::{self, IsTerminal};
+use std::path::Path;
 use std::process::ExitCode;
 use std::{env, ffi::OsStr};
 
@@ -26,11 +27,22 @@ fn main() -> ExitCode {
 
 fn run() -> Result<ExitCode, String> {
     let args: Vec<_> = env::args_os().skip(1).collect();
-    match args.as_slice() {
-        [command, args @ ..] if command == privileged::HELPER => privileged::run_helper(args)?,
-        [] => tui::run(&App::load()?).map_err(|error| format!("terminal: {error}"))?,
+    let (config_path, args) = match args.as_slice() {
+        [flag, path, args @ ..] if flag == "-c" => (Some(Path::new(path)), args),
+        [flag] if flag == "-c" => return Err("-c requires a config file path".into()),
+        args => (None, args),
+    };
+    match args {
+        [command, args @ ..] if config_path.is_none() && command == privileged::HELPER => {
+            privileged::run_helper(args)?
+        }
+        [] => tui::run(&App::load(config_path)?).map_err(|error| format!("terminal: {error}"))?,
+        [command] if command == "validate" => {
+            config::Config::load(config_path)?;
+            println!("Config is valid.");
+        }
         [command] if command == "list" => {
-            let app = App::load()?;
+            let app = App::load(config_path)?;
             for entry in app.entries() {
                 let id = entry.id.escape_debug();
                 let label = entry.label.escape_debug();
@@ -42,7 +54,7 @@ fn run() -> Result<ExitCode, String> {
         }
         [command, id] if command == "install" => {
             let id = id.to_str().ok_or("entry ID must be UTF-8")?;
-            println!("{}", App::load()?.perform(id, Action::Install)?);
+            println!("{}", App::load(config_path)?.perform(id, Action::Install)?);
         }
         [command, id] if command == "set" => {
             let id = id.to_str().ok_or("entry ID must be UTF-8")?;
@@ -52,16 +64,16 @@ fn run() -> Result<ExitCode, String> {
             }
             println!(
                 "{}",
-                App::load()?.perform(id, Action::Set(&mut stdin.lock()))?
+                App::load(config_path)?.perform(id, Action::Set(&mut stdin.lock()))?
             );
         }
         [command, id] if command == "clear" => {
             let id = id.to_str().ok_or("entry ID must be UTF-8")?;
-            println!("{}", App::load()?.perform(id, Action::Clear)?);
+            println!("{}", App::load(config_path)?.perform(id, Action::Clear)?);
         }
         [command, id] if command == "login" => {
             let id = id.to_str().ok_or("entry ID must be UTF-8")?;
-            let app = App::load()?;
+            let app = App::load(config_path)?;
             let commands = app.login_commands(id)?;
             let result = {
                 let interrupt = login::InterruptGuard::new()
@@ -74,14 +86,14 @@ fn run() -> Result<ExitCode, String> {
             }
         }
         [command, id] if command == "restore" => {
-            restore(id, false)?;
+            restore(config_path, id, false)?;
         }
         [command, id, flag] if command == "restore" && flag == "--replace" => {
-            restore(id, true)?;
+            restore(config_path, id, true)?;
         }
         _ => {
             return Err(
-                "usage: secsetter [list | install <id> | set <id> | clear <id> | restore <id> [--replace] | login <id>]"
+                "usage: secsetter [-c <file>] [validate | list | install <id> | set <id> | clear <id> | restore <id> [--replace] | login <id>]"
                     .into(),
             );
         }
@@ -89,8 +101,11 @@ fn run() -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn restore(id: &OsStr, replace: bool) -> Result<(), String> {
+fn restore(config_path: Option<&Path>, id: &OsStr, replace: bool) -> Result<(), String> {
     let id = id.to_str().ok_or("entry ID must be UTF-8")?;
-    println!("{}", App::load()?.perform(id, Action::Restore { replace })?);
+    println!(
+        "{}",
+        App::load(config_path)?.perform(id, Action::Restore { replace })?
+    );
     Ok(())
 }

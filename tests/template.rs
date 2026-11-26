@@ -138,7 +138,89 @@ fn reads_the_default_config_when_xdg_is_unset_or_empty() {
 }
 
 #[test]
+fn validates_an_explicit_config_without_running_actions() {
+    let config = ConfigDir::new(WIDGET);
+    let draft = r#"
+[[entries]]
+id = "draft-login"
+label = "Draft login"
+kind = "login"
+commands = [["/bin/sh", "-c", 'touch "$XDG_CONFIG_HOME/login-ran"']]
+"#;
+    let draft_path = config.root.join("draft.toml");
+    fs::write(&draft_path, format!("{WIDGET}{draft}")).unwrap();
+
+    assert_eq!(stdout(config.run(&["validate"])), "Config is valid.\n");
+    let validated = config
+        .command()
+        .current_dir(&config.root)
+        .args(["-c", "draft.toml", "validate"])
+        .output()
+        .unwrap();
+    assert!(validated.stderr.is_empty());
+    assert_eq!(stdout(validated), "Config is valid.\n");
+    assert!(!config.root.join("login-ran").exists());
+    assert!(!config.root.join("widget").exists());
+    assert!(!config.root.join("templates").exists());
+
+    let list = config
+        .command()
+        .args(["-c"])
+        .arg(&draft_path)
+        .arg("list")
+        .output()
+        .unwrap();
+    assert!(stdout(list).contains("draft-login\t"));
+    assert!(!stdout(config.run(&["list"])).contains("draft-login\t"));
+
+    for file in ["missing.toml", "draft.toml/"] {
+        let failed = config
+            .command()
+            .current_dir(&config.root)
+            .args(["-c", file, "validate"])
+            .output()
+            .unwrap();
+        assert_eq!(failed.status.code(), Some(1));
+        assert!(failed.stdout.is_empty());
+        fails(failed, file);
+    }
+    fails(config.run(&["-c"]), "-c requires a config file path");
+}
+
+#[test]
+fn installs_templates_from_beside_the_selected_config() {
+    let config = ConfigDir::new("");
+    fs::create_dir_all(config.root.join("draft/templates")).unwrap();
+    let draft = config.root.join("draft/custom.toml");
+    fs::write(&draft, WIDGET).unwrap();
+    fs::write(config.root.join("draft/templates/widget.json"), b"draft").unwrap();
+    fs::write(
+        config.root.join("secsetter/templates/widget.json"),
+        b"default",
+    )
+    .unwrap();
+
+    let output = config
+        .command()
+        .arg("-c")
+        .arg(&draft)
+        .args(["install", "vpn-widget"])
+        .output()
+        .unwrap();
+    assert_eq!(stdout(output), "Installed\n");
+    assert_eq!(
+        fs::read(config.root.join("widget/config.json")).unwrap(),
+        b"draft"
+    );
+}
+
+#[test]
 fn rejects_invalid_config_before_installing() {
+    let other_platform = if cfg!(target_os = "linux") {
+        "macos"
+    } else {
+        "linux"
+    };
     let invalid = [
         format!("{WIDGET}\n[[broken\nsensitive-parser-excerpt"),
         format!("{WIDGET}{WIDGET}"),
@@ -154,7 +236,10 @@ fn rejects_invalid_config_before_installing() {
                 .replace("vpn-widget", "invalid")
                 .replace("source = \"widget.json\"", "")
         ),
-        WIDGET.replace("\"widget.json\"", "\"../unconfined.json\""),
+        WIDGET.replace(
+            "source = \"widget.json\"",
+            &format!("source = \"../unconfined.json\"\nplatforms = [\"{other_platform}\"]"),
+        ),
     ];
     for contents in invalid {
         let config = ConfigDir::new(&contents);
@@ -165,6 +250,10 @@ fn rejects_invalid_config_before_installing() {
         .unwrap();
         let error = fails(config.run(&["install", "vpn-widget"]), "invalid");
         assert!(!error.contains("sensitive-parser-excerpt"));
+        let validation = config.run(&["validate"]);
+        assert_eq!(validation.status.code(), Some(1));
+        assert!(validation.stdout.is_empty());
+        assert_eq!(fails(validation, "invalid"), error);
         assert!(!config.root.join("widget").exists());
     }
 }

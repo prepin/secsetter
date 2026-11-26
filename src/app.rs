@@ -48,9 +48,9 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub fn load() -> Result<Self, String> {
+    pub fn load(path: Option<&Path>) -> Result<Self, String> {
         Ok(Self {
-            config: Config::load()?,
+            config: Config::load(path)?,
         })
     }
 

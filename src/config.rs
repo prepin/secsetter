@@ -100,23 +100,29 @@ impl Entry {
 }
 
 impl Config {
-    pub fn load() -> Result<Self, String> {
-        let config_home = match env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
-            Some(value) => PathBuf::from(value),
-            None => home()?.join(".config"),
+    pub fn load(config_path: Option<&Path>) -> Result<Self, String> {
+        let config_path = match config_path {
+            Some(path) => path.to_owned(),
+            None => config_home()?.join("secsetter/config.toml"),
         };
-        if !config_home.is_absolute() {
-            return Err("XDG_CONFIG_HOME must be an absolute path".into());
-        }
-        let path = config_home.join("secsetter");
-        let config_path = path.join("config.toml");
         let read_error = |error: &dyn std::fmt::Display| format!("read {config_path:?}: {error}");
-        let directory = fs::open(&path, OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
+        let path = config_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        // Keep a trailing slash from turning a directory path into a file name.
+        let name = config_path
+            .as_os_str()
+            .as_encoded_bytes()
+            .rsplit(|&byte| byte == b'/')
+            .next()
+            .unwrap();
+        let directory = fs::open(path, OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
             .map_err(|error| read_error(&error))?;
         let mut file = File::from(
             fs::openat(
                 &directory,
-                "config.toml",
+                name,
                 OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
                 Mode::empty(),
             )
@@ -209,8 +215,7 @@ impl Config {
                                 path
                             }
                         };
-                        *path = expand_path(path, &config_home)
-                            .map_err(|reason| invalid_check(&reason))?;
+                        *path = expand_path(path).map_err(|reason| invalid_check(&reason))?;
                     }
                     continue;
                 }
@@ -227,14 +232,21 @@ impl Config {
                     }
                 }
             }
-            *destination =
-                expand_path(destination, &config_home).map_err(|reason| invalid(&reason))?;
+            *destination = expand_path(destination).map_err(|reason| invalid(&reason))?;
         }
         Ok(Self {
             directory,
-            path,
+            path: path.to_owned(),
             entries,
         })
+    }
+}
+
+fn config_home() -> Result<PathBuf, String> {
+    match env::var_os("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+        Some(value) if Path::new(&value).is_absolute() => Ok(PathBuf::from(value)),
+        Some(_) => Err("XDG_CONFIG_HOME must be an absolute path".into()),
+        None => Ok(home()?.join(".config")),
     }
 }
 
@@ -245,12 +257,12 @@ fn home() -> Result<PathBuf, String> {
         .ok_or_else(|| "HOME must be an absolute path".into())
 }
 
-fn expand_path(path: &Path, config_home: &Path) -> Result<PathBuf, String> {
+fn expand_path(path: &Path) -> Result<PathBuf, String> {
     let value = path.to_str().expect("TOML paths are UTF-8");
     let expanded = if let Some(rest) = value.strip_prefix("~/") {
         home()?.join(rest.trim_start_matches('/'))
     } else if let Some(rest) = value.strip_prefix("$XDG_CONFIG_HOME/") {
-        config_home.join(rest.trim_start_matches('/'))
+        config_home()?.join(rest.trim_start_matches('/'))
     } else {
         path.to_owned()
     };
