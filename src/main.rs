@@ -16,7 +16,7 @@ use app::{Action, App, Status};
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             eprintln!("secsetter: {error}");
             ExitCode::FAILURE
@@ -24,7 +24,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<ExitCode, String> {
     let args: Vec<_> = env::args_os().skip(1).collect();
     match args.as_slice() {
         [command, args @ ..] if command == privileged::HELPER => privileged::run_helper(args)?,
@@ -62,10 +62,16 @@ fn run() -> Result<(), String> {
         [command, id] if command == "login" => {
             let id = id.to_str().ok_or("entry ID must be UTF-8")?;
             let app = App::load()?;
-            return Err(format!(
-                "login {id:?}: {}",
-                login::exec(app.login_command(id)?)
-            ));
+            let commands = app.login_commands(id)?;
+            let result = {
+                let interrupt = login::InterruptGuard::new()
+                    .map_err(|error| format!("login {id:?}: {error}"))?;
+                login::run(commands, &interrupt)
+            };
+            if let Err(failure) = result {
+                eprintln!("secsetter: login {id:?}: {failure}");
+                return Ok(failure.exit_code());
+            }
         }
         [command, id] if command == "restore" => {
             restore(id, false)?;
@@ -80,7 +86,7 @@ fn run() -> Result<(), String> {
             );
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn restore(id: &OsStr, replace: bool) -> Result<(), String> {

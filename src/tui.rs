@@ -2,7 +2,6 @@ mod screen;
 mod view;
 
 use std::io;
-use std::os::unix::process::ExitStatusExt;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
@@ -168,7 +167,22 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
                                 Err(error) => notice = error.to_string(),
                             }
                         }
-                        Kind::Login { command } => notice = run_login(&mut screen, command)?,
+                        Kind::Login { commands, .. } => {
+                            let result = screen.with_terminal(
+                                |interrupt| login::run(commands, interrupt),
+                                |result| {
+                                    result
+                                        .as_ref()
+                                        .err()
+                                        .filter(|failure| !failure.interrupted())
+                                        .map(login::Failure::terminal_summary)
+                                },
+                            )?;
+                            notice = result.map_or_else(
+                                |failure| failure.terminal_summary(),
+                                |_| "Login completed".into(),
+                            );
+                        }
                     }
                 }
             }
@@ -184,7 +198,7 @@ fn perform(
     action: Action<'_>,
 ) -> io::Result<String> {
     let result = if entry.ownership().is_some() || matches!(action, Action::Restore { .. }) {
-        screen.with_terminal(|| app.perform(&entry.id, action))?
+        screen.with_terminal(|_| app.perform(&entry.id, action), |_| None)?
     } else {
         app.perform(&entry.id, action)
     };
@@ -243,19 +257,4 @@ fn prompt_secret(screen: &mut Screen, view: &View<'_>) -> io::Result<Option<Stri
             _ => {}
         }
     }
-}
-
-fn run_login(screen: &mut Screen, command: &[String]) -> io::Result<String> {
-    let result = screen.with_terminal(|| login::status(command))?;
-    Ok(match result {
-        Ok(status) if status.success() => "Login completed".into(),
-        Ok(status)
-            if status.signal() == Some(libc::SIGINT)
-                || status.code() == Some(128 + libc::SIGINT) =>
-        {
-            "Login interrupted".into()
-        }
-        Ok(status) => format!("Login failed: {status}"),
-        Err(error) => format!("Could not run login: {error}"),
-    })
 }

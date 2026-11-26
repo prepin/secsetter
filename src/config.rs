@@ -55,7 +55,22 @@ pub(crate) enum Kind {
         destination: PathBuf,
     },
     Login {
-        command: Vec<String>,
+        commands: Vec<Vec<String>>,
+        #[serde(default)]
+        ready_when: Vec<LoginCheck>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) enum LoginCheck {
+    FileExists {
+        path: PathBuf,
+    },
+    FieldSet {
+        path: PathBuf,
+        format: Format,
+        key: Vec<String>,
     },
 }
 
@@ -160,15 +175,42 @@ impl Config {
                     }
                     destination
                 }
-                Kind::Login { command } => {
+                Kind::Login {
+                    commands,
+                    ready_when,
+                } => {
                     if entry.privileged {
                         return Err(invalid("login entries cannot be privileged"));
                     }
-                    if command.first().is_none_or(String::is_empty) {
-                        return Err(invalid("command must start with an executable"));
+                    if commands.is_empty() {
+                        return Err(invalid("commands must contain at least one step"));
                     }
-                    if command.iter().any(|argument| argument.contains('\0')) {
-                        return Err(invalid("command must not contain NUL characters"));
+                    for (index, command) in commands.iter().enumerate() {
+                        let step = index + 1;
+                        if command.first().is_none_or(String::is_empty) {
+                            return Err(invalid(&format!(
+                                "step {step} must start with an executable"
+                            )));
+                        }
+                        if command.iter().any(|argument| argument.contains('\0')) {
+                            return Err(invalid(&format!(
+                                "step {step} must not contain NUL characters"
+                            )));
+                        }
+                    }
+                    for (index, check) in ready_when.iter_mut().enumerate() {
+                        let invalid_check = |reason: &str| {
+                            invalid(&format!("ready_when check {}: {reason}", index + 1))
+                        };
+                        let path = match check {
+                            LoginCheck::FileExists { path } => path,
+                            LoginCheck::FieldSet { path, key, .. } => {
+                                validate_key(key).map_err(invalid_check)?;
+                                path
+                            }
+                        };
+                        *path = expand_path(path, &config_home)
+                            .map_err(|reason| invalid_check(&reason))?;
                     }
                     continue;
                 }
@@ -186,7 +228,7 @@ impl Config {
                 }
             }
             *destination =
-                expand_destination(destination, &config_home).map_err(|reason| invalid(&reason))?;
+                expand_path(destination, &config_home).map_err(|reason| invalid(&reason))?;
         }
         Ok(Self {
             directory,
@@ -203,7 +245,7 @@ fn home() -> Result<PathBuf, String> {
         .ok_or_else(|| "HOME must be an absolute path".into())
 }
 
-fn expand_destination(path: &Path, config_home: &Path) -> Result<PathBuf, String> {
+fn expand_path(path: &Path, config_home: &Path) -> Result<PathBuf, String> {
     let value = path.to_str().expect("TOML paths are UTF-8");
     let expanded = if let Some(rest) = value.strip_prefix("~/") {
         home()?.join(rest.trim_start_matches('/'))
@@ -213,9 +255,7 @@ fn expand_destination(path: &Path, config_home: &Path) -> Result<PathBuf, String
         path.to_owned()
     };
     if !expanded.is_absolute() || expanded.as_os_str().as_encoded_bytes().contains(&0) {
-        return Err(
-            "destination must be an absolute path or start with ~/ or $XDG_CONFIG_HOME/".into(),
-        );
+        return Err("path must be an absolute path or start with ~/ or $XDG_CONFIG_HOME/".into());
     }
     Ok(expanded)
 }

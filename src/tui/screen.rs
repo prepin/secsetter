@@ -1,5 +1,4 @@
-use std::io::{self, IsTerminal, Stdout, stdout};
-use std::{mem, ptr};
+use std::io::{self, IsTerminal, Stdout, Write, stdout};
 
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
@@ -9,6 +8,8 @@ use crossterm::terminal::{
 };
 use ratatui::{Frame, Terminal, backend::CrosstermBackend};
 use rustix::termios::{OptionalActions, tcgetattr, tcsetattr};
+
+use crate::login::InterruptGuard;
 
 pub(super) struct Screen {
     active: bool,
@@ -34,13 +35,25 @@ impl Screen {
         Ok(usable)
     }
 
-    pub(super) fn with_terminal<T>(&mut self, operation: impl FnOnce() -> T) -> io::Result<T> {
-        let _interrupt = InterruptGuard::new()?;
+    pub(super) fn with_terminal<T>(
+        &mut self,
+        operation: impl FnOnce(&InterruptGuard) -> T,
+        pause_message: impl FnOnce(&T) -> Option<String>,
+    ) -> io::Result<T> {
+        let interrupt = InterruptGuard::new()?;
         self.leave()?;
         let original = tcgetattr(io::stdin())?;
-        let result = operation();
-        tcsetattr(io::stdin(), OptionalActions::Now, &original)?;
+        let result = operation(&interrupt);
+        let pause = pause_message(&result);
+        let restore = if pause.is_some() {
+            OptionalActions::Flush
+        } else {
+            OptionalActions::Now
+        };
+        tcsetattr(io::stdin(), restore, &original)?;
+        let waited = pause.as_deref().map_or(Ok(()), wait_for_enter);
         self.resume()?;
+        waited?;
         Ok(result)
     }
 
@@ -61,40 +74,29 @@ impl Screen {
     }
 }
 
+fn wait_for_enter(message: &str) -> io::Result<()> {
+    enable_raw_mode()?;
+    {
+        let mut out = stdout().lock();
+        write!(
+            out,
+            "\r\n{message}\r\nPress Enter to return to SecSetter.\r\n"
+        )?;
+        out.flush()?;
+    }
+    let mut byte = [0];
+    while rustix::io::read(io::stdin(), &mut byte[..])? != 0 {
+        if matches!(byte[0], b'\r' | b'\n' | b'\x03') {
+            break;
+        }
+    }
+    Ok(())
+}
+
 impl Drop for Screen {
     fn drop(&mut self) {
         if self.active {
             let _ = self.leave();
         }
-    }
-}
-
-struct InterruptGuard(libc::sigaction);
-
-impl InterruptGuard {
-    fn new() -> io::Result<Self> {
-        extern "C" fn keep_tui_alive(_: libc::c_int) {}
-
-        // The parent and child share the foreground process group. A caught
-        // handler keeps the TUI alive and resets to the default on exec.
-        // SAFETY: The structures are initialized and the handler is signal-safe.
-        unsafe {
-            let mut action: libc::sigaction = mem::zeroed();
-            action.sa_sigaction = keep_tui_alive as *const () as libc::sighandler_t;
-            action.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut action.sa_mask);
-            let mut previous = mem::MaybeUninit::uninit();
-            if libc::sigaction(libc::SIGINT, &action, previous.as_mut_ptr()) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(Self(previous.assume_init()))
-        }
-    }
-}
-
-impl Drop for InterruptGuard {
-    fn drop(&mut self) {
-        // SAFETY: The saved action came from a successful call to sigaction.
-        unsafe { libc::sigaction(libc::SIGINT, &self.0, ptr::null_mut()) };
     }
 }

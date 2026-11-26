@@ -618,6 +618,8 @@ destination = "$XDG_CONFIG_HOME/secrets/token"
     assert!(!destination.exists());
 
     tui.send(b"\t");
+    tui.read_through("›");
+    tui.read_through("[ Cancel ]");
     tui.resize(32, 10);
     tui.read_through("Install config?");
     tui.read_through("…/token");

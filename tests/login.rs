@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, ExitStatus};
 use std::ptr;
@@ -15,7 +16,7 @@ const LOGIN: &str = r#"
 id = "demo"
 label = "Synthetic sign-in"
 kind = "login"
-command = ["sh", "-c", "printf '%s\\n' \"$1\"; exit 43", "demo", "$HOME; exit 0"]
+commands = [["sh", "-c", "printf '%s\\n' \"$1\"; exit 43", "demo", "$HOME; exit 0"]]
 "#;
 
 const TEMPLATE: &str = r#"
@@ -39,7 +40,7 @@ impl ConfigDir {
 
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_secsetter"));
-        command.env("XDG_CONFIG_HOME", self.0.path());
+        command.env("XDG_CONFIG_HOME", self.0.path().canonicalize().unwrap());
         command
     }
 }
@@ -57,18 +58,97 @@ fn cli_passes_literal_arguments_and_returns_the_command_exit_code() {
 }
 
 #[test]
+fn cli_runs_steps_in_order_and_stops_at_the_first_failure() {
+    let entry = LOGIN.split_once("commands =").unwrap().0;
+    let config = ConfigDir::new(&format!(
+        r#"{entry}commands = [
+  ["/bin/sh", "-c", "printf 'first\\n'"],
+  ["/bin/sh", "-c", "printf 'second\\n'; exit 19"],
+  ["/bin/sh", "-c", "printf 'third\\n'"],
+]"#
+    ));
+    let output = config.command().args(["login", "demo"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(19), "{output:?}");
+    assert_eq!(output.stdout, b"first\nsecond\n");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Login failed at step 2: exit status: 19")
+    );
+}
+
+#[test]
+fn login_status_requires_all_local_checks_and_never_runs_login_steps() {
+    let config = ConfigDir::new(&format!(
+        r#"{LOGIN}
+ready_when = [
+  {{ kind = "field-set", path = "$XDG_CONFIG_HOME/account.json", format = "json", key = ["account", "user"] }},
+  {{ kind = "file-exists", path = "$XDG_CONFIG_HOME/profile" }},
+]
+"#
+    ));
+    let account = config.0.path().join("account.json");
+    let profile = config.0.path().join("profile");
+    let list = || {
+        let output = config.command().arg("list").output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty());
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let needed = "demo\tSynthetic sign-in\tLogin needed\n";
+
+    assert_eq!(list(), needed);
+    fs::write(&account, r#"{"account":{"user":"synthetic-user"}}"#).unwrap();
+    assert_eq!(list(), needed);
+    fs::write(&profile, "").unwrap();
+    assert_eq!(list(), "demo\tSynthetic sign-in\tLogin configured\n");
+    for contents in [r#"{"account":{"user":""}}"#, r#"{"account":{}}"#] {
+        fs::write(&account, contents).unwrap();
+        assert_eq!(list(), needed);
+    }
+    fs::write(&account, r#"{"account":{"user":"do-not-display""#).unwrap();
+    let status = list();
+    assert!(status.starts_with("demo\tSynthetic sign-in\tUnknown:"));
+    assert!(status.contains("account.json"));
+    assert!(!status.contains("do-not-display"));
+    fs::remove_file(&profile).unwrap();
+    assert_eq!(list(), needed);
+
+    fs::write(&account, r#"{"account":{"user":"synthetic-user"}}"#).unwrap();
+    symlink(&account, &profile).unwrap();
+    let status = list();
+    assert!(status.contains("Unknown:") && status.contains("symbolic link"));
+}
+
+#[test]
+fn rejects_invalid_login_checks_at_config_load() {
+    for check in [
+        r#"{ kind = "file-exists", path = "relative/profile" }"#,
+        r#"{ kind = "field-set", path = "~/profile", format = "toml", key = [] }"#,
+        r#"{ kind = "field-set", path = "~/profile", format = "toml" }"#,
+    ] {
+        let config = ConfigDir::new(&format!("{LOGIN}\nready_when = [{check}]"));
+        let output = config.command().arg("list").output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("invalid"));
+    }
+}
+
+#[test]
 fn refuses_invalid_commands_before_running_a_login() {
     for invalid in [
-        r#"command = []"#,
-        r#"command = [""]"#,
-        r#"command = ["sh", "\u0000"]"#,
-        "privileged = true\ncommand = [\"sh\"]",
+        r#"commands = []"#,
+        r#"commands = [["/bin/echo", "must not run"], []]"#,
+        r#"commands = [[""]]"#,
+        r#"commands = [["sh", "\u0000"]]"#,
+        "privileged = true\ncommands = [[\"sh\"]]",
+        r#"command = ["sh"]"#,
         "",
     ] {
-        let entry = LOGIN.split_once("command =").unwrap().0;
+        let entry = LOGIN.split_once("commands =").unwrap().0;
         let config = ConfigDir::new(&format!("{entry}{invalid}"));
         let output = config.command().args(["login", "demo"]).output().unwrap();
         assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
         assert!(String::from_utf8_lossy(&output.stderr).contains("invalid"));
     }
 }
@@ -81,8 +161,8 @@ fn login_rejects_unknown_ids_inapplicable_entries_and_other_kinds() {
         "linux"
     };
     let login = LOGIN.replace(
-        "command =",
-        &format!("platforms = [\"{other_platform}\"]\ncommand ="),
+        "commands =",
+        &format!("platforms = [\"{other_platform}\"]\ncommands ="),
     );
     let config = ConfigDir::new(&format!("{login}{TEMPLATE}"));
     for (id, reason) in [
@@ -98,8 +178,8 @@ fn login_rejects_unknown_ids_inapplicable_entries_and_other_kinds() {
 
 #[test]
 fn runs_a_configured_script_only_with_an_explicit_interpreter() {
-    let entry = LOGIN.split_once("command =").unwrap().0;
-    let config = ConfigDir::new(&format!(r#"{entry}command = ["bare-script"]"#));
+    let entry = LOGIN.split_once("commands =").unwrap().0;
+    let config = ConfigDir::new(&format!(r#"{entry}commands = [["bare-script"]]"#));
     let script = config.0.path().join("bare-script");
     fs::write(&script, "echo 'must not run'\n").unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
@@ -121,21 +201,35 @@ const INTERACTIVE_LOGIN: &str = r#"
 id = "demo"
 label = "Synthetic sign-in"
 kind = "login"
-command = ["/bin/sh", "-c", '''
+commands = [
+["/bin/sh", "-c", '''
 test -t 0 && test -t 1 && test -t 2 || exit 90
 printf 'Synthetic prompt: ' >/dev/tty
 IFS= read -r reply </dev/tty || exit 91
 test "$reply" = "synthetic answer" || exit 42
 printf 'Read answer\n'
-''']
+'''],
+["/bin/sh", "-c", '''
+printf 'Next prompt: ' >/dev/tty
+IFS= read -r reply </dev/tty || exit 91
+test "$reply" = "second answer" || exit 44
+: > "$XDG_CONFIG_HOME/ready-marker" || exit 45
+printf 'Read second answer\n'
+'''],
+]
 "#;
 
 #[test]
 fn tui_returns_to_the_list_after_an_interactive_login_succeeds() {
-    let config = ConfigDir::new(&format!("{INTERACTIVE_LOGIN}{TEMPLATE}"));
+    let config = ConfigDir::new(&format!(
+        r#"{INTERACTIVE_LOGIN}
+ready_when = [{{ kind = "file-exists", path = "$XDG_CONFIG_HOME/ready-marker" }}]
+{TEMPLATE}"#
+    ));
     let mut pty = Terminal::launch(config.command());
     assert!(pty.expect("○ Not installed").contains("\x1b[?2004h"));
     assert!(pty.expect("sign-in").contains("Login"));
+    pty.expect("needed");
 
     pty.send(b"\x1b[B");
     pty.expect("› Synthetic sign-in");
@@ -143,24 +237,46 @@ fn tui_returns_to_the_list_after_an_interactive_login_succeeds() {
     let suspended = pty.expect("Synthetic prompt: ");
     assert!(suspended.contains("\x1b[?2004l") && suspended.contains("\x1b[?1049l"));
     pty.send(b"synthetic answer\n");
+    let between = pty.expect("Next prompt: ");
+    assert!(between.contains("Read answer") && !between.contains("\x1b[?1049h"));
+    pty.send(b"second answer\n");
     let result = pty.expect("completed");
-    assert!(result.contains("Read answer"));
+    assert!(result.contains("Read second answer"));
+    assert!(result.contains("configured"));
     assert!(result.contains("\x1b[?2004h"));
     assert!(result.contains("\x1b[?1049h") && result.contains("Synthetic sign-in"));
     pty.quit();
 }
 
 #[test]
-fn tui_returns_to_the_list_with_the_command_failure_status() {
-    let config = ConfigDir::new(INTERACTIVE_LOGIN);
+fn tui_keeps_login_failure_output_visible_until_enter() {
+    let config = ConfigDir::new(&INTERACTIVE_LOGIN.replace(
+        "|| exit 42",
+        "|| { printf 'Synthetic login failure\\n' >&2; exit 42; }",
+    ));
     let mut pty = Terminal::launch(config.command());
     pty.expect("Synthetic sign-in");
     pty.send(b"\r");
     pty.expect("Synthetic prompt: ");
 
     pty.send(b"wrong answer\n");
-    let result = pty.expect("status:");
-    assert!(result.contains("failed:"));
+    let failure = pty.expect("Press Enter to return to SecSetter.\r\n");
+    assert!(failure.contains("Synthetic login failure"));
+    assert!(failure.contains("Login failed at step 1 of 2 (exit code 42)."));
+    assert!(!failure.contains("\x1b[?1049h") && !failure.contains("Next prompt:"));
+
+    pty.send(b"q");
+    assert!(pty.unread.is_empty());
+    let mut poll = libc::pollfd {
+        fd: pty.master.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: The descriptor is live, and the pointer refers to one pollfd.
+    assert_eq!(unsafe { libc::poll(&mut poll, 1, 100) }, 0);
+
+    pty.send(b"\r");
+    let result = pty.expect("failed");
     assert!(result.contains("\x1b[?1049h") && result.contains("Synthetic sign-in"));
     pty.expect("42");
     pty.quit();
@@ -168,24 +284,29 @@ fn tui_returns_to_the_list_with_the_command_failure_status() {
 
 #[test]
 fn tui_returns_to_the_list_when_the_executable_is_missing() {
-    let entry = LOGIN.split_once("command =").unwrap().0;
-    let config = ConfigDir::new(&format!(r#"{entry}command = ["./missing-login-command"]"#));
+    let entry = LOGIN.split_once("commands =").unwrap().0;
+    let config = ConfigDir::new(&format!(
+        r#"{entry}commands = [["./missing-login-command"]]"#
+    ));
     let mut pty = Terminal::launch(config.command());
     pty.expect("Synthetic sign-in");
     pty.send(b"\r");
 
-    let result = pty.expect("login:");
-    assert!(result.contains("Could") && result.contains("run"));
-    assert!(result.contains("\x1b[?1049l") && result.contains("\x1b[?1049h"));
+    let failure = pty.expect("Press Enter to return to SecSetter.");
+    assert!(failure.contains("Could not run login step 1 of 1:"));
+    assert!(failure.contains("\x1b[?1049l") && !failure.contains("\x1b[?1049h"));
+    pty.send(b"\x03");
+    let result = pty.expect("login");
+    assert!(result.contains("\x1b[?1049h"));
     assert!(result.contains("Synthetic sign-in"));
     pty.quit();
 }
 
 #[test]
-fn tui_returns_to_the_list_after_ctrl_c_and_restores_terminal_modes() {
+fn tui_stops_on_ctrl_c_even_if_the_step_exits_successfully_and_restores_terminal_modes() {
     let config = ConfigDir::new(&INTERACTIVE_LOGIN.replace(
         "printf 'Synthetic prompt",
-        "stty -echo </dev/tty\nprintf 'Synthetic prompt",
+        "trap 'echo Caught interrupt; exit 0' INT\nstty -echo </dev/tty\nprintf 'Synthetic prompt",
     ));
     let mut pty = Terminal::launch(config.command());
     pty.expect("Synthetic sign-in");
@@ -197,6 +318,7 @@ fn tui_returns_to_the_list_after_ctrl_c_and_restores_terminal_modes() {
 
     pty.send(b"\x03");
     let result = pty.expect("interrupted");
+    assert!(result.contains("Caught interrupt"));
     assert!(result.contains("\x1b[?1049h") && result.contains("Synthetic sign-in"));
     pty.quit();
     let restored_modes = tcgetattr(&pty.slave).unwrap().local_modes;

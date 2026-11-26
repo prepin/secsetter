@@ -14,6 +14,7 @@ use crate::paths::PathError;
 
 const ACCENT: Color = Color::Cyan;
 const STATUS_WIDTH: usize = 15;
+const LOGIN_STATUS_WIDTH: usize = 18;
 const WRAP: Wrap = Wrap { trim: true };
 
 #[derive(Clone, Copy)]
@@ -189,7 +190,7 @@ impl View<'_> {
                 Some(status) => badge(status),
                 None => badge(&self.app.status(entry)),
             };
-            lines.push(entry_line(&entry.label, badge, area.width, selected));
+            lines.push(entry_line(entry, badge, area.width, selected));
         }
         frame.render_widget(Paragraph::new(lines), area);
     }
@@ -212,6 +213,8 @@ fn badge(status: &Status) -> (&'static str, Color) {
         Status::NotInstalled => ("○ Not installed", Color::Yellow),
         Status::Set => ("✓ Set", Color::Green),
         Status::NotSet => ("○ Not set", Color::Yellow),
+        Status::LoginConfigured => ("✓ Login configured", Color::Green),
+        Status::LoginNeeded => ("○ Login needed", Color::Yellow),
         Status::Blocked(_) => ("! Blocked", Color::Red),
         Status::Unknown(_) => ("? Unknown", Color::Yellow),
         Status::Untracked => ("→", ACCENT),
@@ -219,13 +222,18 @@ fn badge(status: &Status) -> (&'static str, Color) {
 }
 
 fn entry_line(
-    label: &str,
+    entry: &Entry,
     (badge, color): (&str, Color),
     width: u16,
     selected: bool,
 ) -> Line<'static> {
-    let label_width = usize::from(width).saturating_sub(STATUS_WIDTH + 4);
-    let label = fit(label, label_width);
+    let status_width = if matches!(entry.kind, Kind::Login { .. }) {
+        LOGIN_STATUS_WIDTH
+    } else {
+        STATUS_WIDTH
+    };
+    let label_width = usize::from(width).saturating_sub(status_width + 4);
+    let label = fit(&entry.label, label_width);
     let padding = " ".repeat(label_width.saturating_sub(label.width()));
     let title = if selected {
         format!("› {label}{padding}")
@@ -258,7 +266,7 @@ fn render_details(frame: &mut Frame, area: Rect, entry: &Entry, status: &Status)
             },
         ),
         Kind::FnoxFile { destination, .. } => (Some(destination), "Enter to restore from fnox"),
-        Kind::Login { .. } => (None, "Enter to start the login command"),
+        Kind::Login { .. } => (None, "Enter to run login steps"),
     };
     let error = match status {
         Status::Blocked(error) | Status::Unknown(error) => Some(error),
@@ -266,17 +274,21 @@ fn render_details(frame: &mut Frame, area: Rect, entry: &Entry, status: &Status)
     };
     let action = match status {
         Status::Blocked(_) => "See the reason below",
-        Status::Unknown(_) if entry.ownership().is_none() => "See the reason below",
+        Status::Unknown(_)
+            if !matches!(entry.kind, Kind::Login { .. }) && entry.ownership().is_none() =>
+        {
+            "See the reason below"
+        }
         _ => action,
     };
     let [summary, body] = Layout::vertical([Length(6), Min(0)]).areas(area);
     frame.render_widget(
         Paragraph::new(vec![
             fit(&entry.label, usize::from(area.width)).bold().into(),
-            if destination.is_some() {
-                badge.fg(color).into()
-            } else {
+            if matches!(status, Status::Untracked) {
                 "→ Login action".fg(ACCENT).into()
+            } else {
+                badge.fg(color).into()
             },
             Line::default(),
             "Next action".fg(ACCENT).into(),
