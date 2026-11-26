@@ -1,3 +1,5 @@
+mod json;
+mod toml;
 mod yaml;
 
 use std::fs::File;
@@ -11,6 +13,8 @@ use crate::paths::{Location, PathError};
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Format {
+    Json,
+    Toml,
     Yaml,
 }
 
@@ -24,6 +28,8 @@ impl Format {
         let mut file = Location::destination(destination, false)?.open_regular()?;
         let document = read_document(&mut file, destination)?;
         let result = match self {
+            Self::Json => json::is_set(document, key),
+            Self::Toml => toml::is_set(document, key),
             Self::Yaml => yaml::is_set(document, key),
         };
         result.map_err(|reason| PathError::Blocked(destination.to_owned(), reason))
@@ -49,6 +55,8 @@ impl Format {
         let mut file = location.open_regular().map_err(file_error)?;
         let document = read_document(&mut file, destination).map_err(file_error)?;
         let edited = match self {
+            Self::Json => json::edit(document, key, value),
+            Self::Toml => toml::edit(document, key, value),
             Self::Yaml => yaml::edit(document, key, value),
         }
         .map_err(|error| match error {
