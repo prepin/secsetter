@@ -10,7 +10,9 @@ libc = "0.2"
 oneyaml = "1.2"
 rustix = { version = "1", features = ["fs", "process", "termios"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
 toml = "1"
+toml_edit = "0.25"
 unicode-width = "0.2"
 
 [dev-dependencies]

@@ -9,27 +9,39 @@ use rustix::fs::{FlockOperation, flock};
 struct Fixture {
     _dir: tempfile::TempDir,
     root: PathBuf,
+    destination: PathBuf,
 }
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_format("yaml", "yml")
+    }
+
+    fn with_format(format: &str, extension: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
+        let destination = format!("glab/config.{extension}");
         fs::create_dir(root.join("secsetter")).unwrap();
         fs::write(
             root.join("secsetter/config.toml"),
-            r#"
+            format!(
+                r#"
 [[entries]]
 id = "token"
 label = "GitLab token"
 kind = "secret-field"
-destination = "$XDG_CONFIG_HOME/glab/config.yml"
-format = "yaml"
+destination = "$XDG_CONFIG_HOME/{destination}"
+format = "{format}"
 key = ["hosts", "gitlab.example.com", "token"]
 "#,
+            ),
         )
         .unwrap();
-        Self { _dir: dir, root }
+        Self {
+            _dir: dir,
+            destination: root.join(destination),
+            root,
+        }
     }
 
     fn command(&self) -> Command {
@@ -39,7 +51,7 @@ key = ["hosts", "gitlab.example.com", "token"]
     }
 
     fn destination(&self) -> PathBuf {
-        self.root.join("glab/config.yml")
+        self.destination.clone()
     }
 
     fn start_set(&self, id: &str) -> Child {
@@ -80,6 +92,204 @@ fn failure(output: Output, reason: &str) -> String {
     assert!(error.contains(reason), "{error}");
     assert!(!error.contains("secret-value"), "{error}");
     error
+}
+
+#[test]
+fn replaces_a_literal_toml_field_and_keeps_comments_and_other_values() {
+    let fixture = Fixture::with_format("toml", "toml");
+    let path = fixture.destination();
+    fs::create_dir(path.parent().unwrap()).unwrap();
+    let original = r#"# hosts file
+hosts."gitlab\u002Eexample.com".token = '' # keep token comment
+hosts."gitlab\u002Eexample.com".retries = 0x10 # keep original integer
+hosts.gitlab.example.com.token = 'unrelated'
+# footer
+"#;
+    fs::write(&path, original).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let old_metadata = fs::metadata(&path).unwrap();
+
+    assert_eq!(fixture.list(), "token\tGitLab token\tNot set\n");
+    assert_eq!(success(fixture.set(b"synthetic-token")), "Set\n");
+    assert_eq!(fixture.list(), "token\tGitLab token\tSet\n");
+    let expected = original.replacen("''", "\"synthetic-token\"", 1);
+    assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+
+    let secret = "  \"quoted\"\\ café\r\n\0\u{1b}\n \n";
+    assert_eq!(success(fixture.set(secret.as_bytes())), "Set\n");
+    let edited = fs::read_to_string(&path).unwrap();
+    let document: toml::Table = toml::from_str(&edited).unwrap();
+    assert_eq!(
+        document["hosts"]["gitlab.example.com"]["token"].as_str(),
+        Some(secret)
+    );
+    let new_metadata = fs::metadata(&path).unwrap();
+    assert_eq!(new_metadata.mode() & 0o777, 0o600);
+    assert_eq!(new_metadata.uid(), old_metadata.uid());
+    assert_ne!(new_metadata.ino(), old_metadata.ino());
+}
+
+#[test]
+fn adds_a_toml_field_to_an_existing_inline_table() {
+    let fixture = Fixture::with_format("toml", "toml");
+    let path = fixture.destination();
+    fs::create_dir(path.parent().unwrap()).unwrap();
+    let original = r#"hosts = { "gitlab.example.com".retries = 0x10, other = {} } # hosts
+# footer
+"#;
+    fs::write(&path, original).unwrap();
+    assert_eq!(fixture.list(), "token\tGitLab token\tNot set\n");
+
+    assert_eq!(success(fixture.set(b"synthetic-token")), "Set\n");
+    assert_eq!(fixture.list(), "token\tGitLab token\tSet\n");
+    let edited = fs::read_to_string(&path).unwrap();
+    let document: toml::Table = toml::from_str(&edited).unwrap();
+    assert_eq!(
+        document["hosts"]["gitlab.example.com"]["token"].as_str(),
+        Some("synthetic-token")
+    );
+    assert!(edited.contains(r#""gitlab.example.com".retries = 0x10"#));
+    assert!(edited.ends_with("} # hosts\n# footer\n"));
+    assert!(document["hosts"]["other"].as_table().unwrap().is_empty());
+}
+
+#[test]
+fn sets_a_literal_json_field_without_changing_unrelated_numbers_or_values() {
+    let fixture = Fixture::with_format("json", "json");
+    let path = fixture.destination();
+    fs::create_dir(path.parent().unwrap()).unwrap();
+    let original = r#"{
+  "hosts": {
+    "gitlab\u002eexample.com": {
+      "options": [0.12345678901234567890123456789, 18446744073709551616, 1e999, -0],
+      "token": ""
+    },
+    "gitlab": {"example": {"com": {"token": "unrelated"}}}
+  }
+}
+"#;
+    fs::write(&path, original).unwrap();
+    assert_eq!(fixture.list(), "token\tGitLab token\tNot set\n");
+
+    let secret = " \t\"quoted\"\\ café\r\n\0\u{1b}\n \n";
+    let literal = r#"" \t\"quoted\"\\ café\r\n\u0000\u001b\n \n""#;
+    assert_eq!(success(fixture.set(secret.as_bytes())), "Set\n");
+    assert_eq!(fixture.list(), "token\tGitLab token\tSet\n");
+    let expected = original.replacen("\"token\": \"\"", &format!("\"token\": {literal}"), 1);
+    assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+}
+
+#[test]
+fn adds_a_json_field_to_empty_and_nonempty_objects() {
+    let fixture = Fixture::with_format("json", "json");
+    let path = fixture.destination();
+    fs::create_dir(path.parent().unwrap()).unwrap();
+
+    for (host, expected) in [
+        ("{\n    }", "{\"token\":\"synthetic-token\"\n    }"),
+        (
+            "{\"retries\":2\n    }",
+            "{\"retries\":2,\"token\":\"synthetic-token\"\n    }",
+        ),
+    ] {
+        let original = format!(r#"{{"hosts":{{"gitlab.example.com":{host}}}}}"#);
+        fs::write(&path, &original).unwrap();
+        assert_eq!(fixture.list(), "token\tGitLab token\tNot set\n");
+        assert_eq!(success(fixture.set(b"synthetic-token")), "Set\n");
+        assert_eq!(fixture.list(), "token\tGitLab token\tSet\n");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original.replacen(host, expected, 1)
+        );
+    }
+}
+
+#[test]
+fn blocks_invalid_toml_and_json_documents_and_paths_without_excerpts() {
+    let cases: &[(&str, &str, &str)] = &[
+        ("toml", "hosts = 'old-secret-value", "invalid TOML document"),
+        (
+            "toml",
+            r#"[hosts."gitlab.example.com"]
+token = "old-secret-value"
+"to\u006ben" = ""
+"#,
+            "duplicate key",
+        ),
+        (
+            "toml",
+            r#"[[hosts."gitlab.example.com"]]
+token = "old-secret-value"
+"#,
+            "expected a TOML table",
+        ),
+        (
+            "toml",
+            r#"hosts."gitlab.example.com".token = ["old-secret-value"]"#,
+            "expected a TOML string",
+        ),
+        (
+            "json",
+            r#"{"hosts":{} /* old-secret-value */}"#,
+            "invalid JSON document",
+        ),
+        (
+            "json",
+            r#"{"hosts":{"gitlab.example.com":{"token":"old-secret-value","to\u006ben":""}}}"#,
+            "duplicate key",
+        ),
+        (
+            "json",
+            r#"{"hosts":{"gitlab.example.com":{}},"unrelated":[{"x":"old-secret-value","x":1}]}"#,
+            "duplicate key",
+        ),
+        (
+            "json",
+            r#"{"hosts":[{"gitlab.example.com":{"token":"old-secret-value"}}]}"#,
+            "expected a JSON object",
+        ),
+        (
+            "json",
+            r#"{"hosts":{"gitlab.example.com":{"token":null}}}"#,
+            "expected a JSON string",
+        ),
+        ("json", "null", "expected a JSON object"),
+    ];
+    for (format, original, reason) in cases {
+        let fixture = Fixture::with_format(format, format);
+        let path = fixture.destination();
+        fs::create_dir(path.parent().unwrap()).unwrap();
+        fs::write(&path, original).unwrap();
+        let listed = fixture.list();
+        assert!(listed.contains("\tBlocked:"), "{listed}");
+        assert!(listed.contains(reason), "{listed}");
+        assert!(!listed.contains("secret-value"), "{listed}");
+        let error = failure(fixture.set(b"incoming-secret-value"), reason);
+        assert!(error.contains(&format!("glab/config.{format}")), "{error}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), *original);
+    }
+}
+
+#[test]
+fn reports_missing_toml_and_json_prerequisites_without_creating_them() {
+    for (format, original) in [
+        ("toml", "[hosts]\nother = 3\n"),
+        ("json", r#"{"hosts":{"other":3}}"#),
+    ] {
+        let fixture = Fixture::with_format(format, format);
+        let path = fixture.destination();
+        assert_eq!(fixture.list(), "token\tGitLab token\tNot set\n");
+        failure(fixture.set(b"synthetic-token"), "requires an existing file");
+        assert!(!path.exists());
+        fs::create_dir(path.parent().unwrap()).unwrap();
+        fs::write(&path, original).unwrap();
+        assert_eq!(fixture.list(), "token\tGitLab token\tNot set\n");
+        failure(
+            fixture.set(b"synthetic-token"),
+            "parent object [\"hosts\", \"gitlab.example.com\"] does not exist",
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
 }
 
 #[test]
