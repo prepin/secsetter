@@ -5,8 +5,9 @@ use std::io::{self, Read};
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 
-use rustix::fs::{self, AtFlags, CWD, FileType, Mode, OFlags, RenameFlags};
+use rustix::fs::{self, AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, RenameFlags};
 use rustix::io::Errno;
+use rustix::process::Uid;
 
 const PRIVATE_DIR: Mode = Mode::RWXU;
 const PRIVATE_FILE: Mode = Mode::RUSR.union(Mode::WUSR);
@@ -131,7 +132,46 @@ impl<'a> Location<'a> {
         Ok(File::from(file))
     }
 
-    pub fn create_file(&self, mut input: impl Read) -> Result<bool, PathError> {
+    pub fn lock(&self) -> Result<LockedLocation<'_, 'a>, PathError> {
+        let lock_error = |error| PathError::io(&self.path, "lock directory for", error);
+        // Lock the pinned directory: its inode stays stable when files are replaced.
+        let guard = fs::openat(
+            &self.parent,
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(lock_error)?;
+        loop {
+            match fs::flock(&guard, FlockOperation::LockExclusive) {
+                Ok(()) => break,
+                Err(Errno::INTR) => continue,
+                Err(error) => return Err(lock_error(error)),
+            }
+        }
+        Ok(LockedLocation {
+            location: self,
+            _guard: guard,
+        })
+    }
+
+    pub fn create_file(&self, input: impl Read) -> Result<bool, PathError> {
+        let stage = self.stage_file(input, None)?;
+        match stage.commit_new(self) {
+            Ok(()) => Ok(true),
+            Err(Errno::EXIST) => {
+                self.regular_file()?;
+                Ok(false)
+            }
+            Err(error) => Err(PathError::io(&self.path, "install", error)),
+        }
+    }
+
+    fn stage_file(
+        &self,
+        mut input: impl Read,
+        owner: Option<Uid>,
+    ) -> Result<StagingDir<'_>, PathError> {
         let stage = StagingDir::new(self)?;
         let write_error = |error| PathError::io(&self.path, "write temporary file for", error);
         let mut file = File::from(
@@ -144,22 +184,49 @@ impl<'a> Location<'a> {
             .map_err(|error| write_error(error.into()))?,
         );
         io::copy(&mut input, &mut file).map_err(write_error)?;
+        if let Some(owner) = owner.filter(|&owner| owner != rustix::process::geteuid()) {
+            fs::fchown(&file, Some(owner), None).map_err(|error| write_error(error.into()))?;
+        }
         fs::fchmod(&file, PRIVATE_FILE).map_err(|error| write_error(error.into()))?;
         file.sync_all().map_err(write_error)?;
-        match fs::renameat_with(
-            &stage.fd,
-            "file",
-            &self.parent,
-            self.name,
-            RenameFlags::NOREPLACE,
-        ) {
-            Ok(()) => Ok(true),
-            Err(Errno::EXIST) => {
-                self.regular_file()?;
-                Ok(false)
+        Ok(stage)
+    }
+}
+
+pub(crate) struct LockedLocation<'location, 'path> {
+    location: &'location Location<'path>,
+    _guard: OwnedFd,
+}
+
+impl LockedLocation<'_, '_> {
+    pub fn write_file(&self, input: impl Read) -> Result<(), PathError> {
+        let location = self.location;
+        let existing = match location.regular_file() {
+            Ok(stat) => Some(stat),
+            Err(PathError::Missing(_)) => None,
+            Err(error) => return Err(error),
+        };
+        let owner = existing.map(|stat| Uid::from_raw(stat.st_uid));
+        let stage = location.stage_file(input, owner)?;
+
+        let commit = if let Some(existing) = existing {
+            let current = location.regular_file()?;
+            if (current.st_dev, current.st_ino, current.st_uid)
+                != (existing.st_dev, existing.st_ino, existing.st_uid)
+            {
+                return Err(PathError::Blocked(
+                    location.path.clone(),
+                    "destination changed during write",
+                ));
             }
-            Err(error) => Err(PathError::io(&self.path, "install", error)),
+            fs::renameat(&stage.fd, "file", &location.parent, location.name)
+        } else {
+            stage.commit_new(location)
+        };
+        if commit == Err(Errno::EXIST) {
+            location.regular_file()?;
         }
+        commit.map_err(|error| PathError::io(&location.path, "commit write for", error))
     }
 }
 
@@ -199,6 +266,16 @@ struct StagingDir<'a> {
 }
 
 impl<'a> StagingDir<'a> {
+    fn commit_new(&self, destination: &Location<'_>) -> Result<(), Errno> {
+        fs::renameat_with(
+            &self.fd,
+            "file",
+            &destination.parent,
+            destination.name,
+            RenameFlags::NOREPLACE,
+        )
+    }
+
     fn new(destination: &'a Location<'_>) -> Result<Self, PathError> {
         let error = |cause: io::Error| PathError::io(&destination.path, "stage write for", cause);
         let mut random = [0; 16];
@@ -229,7 +306,43 @@ impl<'a> StagingDir<'a> {
             let _ = fs::unlinkat(parent, name.as_str(), AtFlags::REMOVEDIR);
             return Err(error(cause));
         }
-        Ok(Self { parent, name, fd })
+        let stage = Self { parent, name, fd };
+        #[cfg(target_os = "macos")]
+        clear_inherited_acl(&stage.fd).map_err(error)?;
+        Ok(stage)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clear_inherited_acl(directory: &OwnedFd) -> io::Result<()> {
+    use std::ffi::{c_int, c_void};
+    use std::os::fd::AsRawFd;
+
+    unsafe extern "C" {
+        fn acl_init(count: c_int) -> *mut c_void;
+        fn acl_set_fd(fd: c_int, acl: *mut c_void) -> c_int;
+        fn acl_free(acl: *mut c_void) -> c_int;
+    }
+
+    // Darwin ACLs can grant access beyond mode 0700. Clear them before staging data.
+    // SAFETY: The ACL is allocated by acl_init, used with a live fd, and freed once.
+    unsafe {
+        let acl = acl_init(0);
+        if acl.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let result = if acl_set_fd(directory.as_raw_fd(), acl) == 0 {
+            Ok(())
+        } else {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Unsupported {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        };
+        acl_free(acl);
+        result
     }
 }
 
@@ -311,5 +424,50 @@ mod tests {
 
         assert!(parent.is_symlink());
         assert!(!outside.join("config").exists());
+    }
+
+    #[test]
+    fn keeps_the_old_secret_and_removes_staging_after_a_partial_read_error() {
+        struct ReadError;
+
+        impl Read for ReadError {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("synthetic read failure"))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let path = parent.join("token");
+        fs::write(&path, b"old synthetic secret").unwrap();
+        let location = Location::destination(&path, false).unwrap();
+
+        let result = location
+            .lock()
+            .unwrap()
+            .write_file(b"partial replacement".as_slice().chain(ReadError));
+        assert!(matches!(result, Err(PathError::Io(..))));
+        assert_eq!(fs::read(&path).unwrap(), b"old synthetic secret");
+        assert_eq!(fs::read_dir(parent).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn rejects_a_link_substituted_during_a_secret_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let path = parent.join("token");
+        let target = parent.join("outside");
+        fs::write(&path, b"old synthetic secret").unwrap();
+        fs::write(&target, b"unchanged").unwrap();
+        let location = Location::destination(&path, false).unwrap();
+
+        let result = location.lock().unwrap().write_file(WhileCopying(Some(|| {
+            fs::remove_file(&path).unwrap();
+            symlink(&target, &path).unwrap();
+        })));
+        assert!(matches!(result, Err(PathError::Blocked(..))));
+        assert!(path.is_symlink());
+        assert_eq!(fs::read(target).unwrap(), b"unchanged");
+        assert_eq!(fs::read_dir(parent).unwrap().count(), 2);
     }
 }

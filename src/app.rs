@@ -1,15 +1,19 @@
 use std::fmt;
+use std::io::Read;
 
 use crate::config::{Config, Entry, Kind};
 use crate::paths::{self, Location, PathError};
 
-pub(crate) enum Action {
+pub(crate) enum Action<'a> {
     Install,
+    Set(&'a mut dyn Read),
 }
 
 pub(crate) enum Status {
     Installed,
     NotInstalled,
+    Set,
+    NotSet,
     Blocked(PathError),
     Unknown(PathError),
 }
@@ -19,6 +23,8 @@ impl fmt::Display for Status {
         match self {
             Self::Installed => f.write_str("Installed"),
             Self::NotInstalled => f.write_str("Not installed"),
+            Self::Set => f.write_str("Set"),
+            Self::NotSet => f.write_str("Not set"),
             Self::Blocked(error) => write!(f, "Blocked: {error}"),
             Self::Unknown(error) => write!(f, "Unknown: {error}"),
         }
@@ -44,10 +50,15 @@ impl App {
     }
 
     pub fn status(&self, entry: &Entry) -> Status {
-        let Kind::Template { destination, .. } = &entry.kind;
+        let (destination, template) = match &entry.kind {
+            Kind::Template { destination, .. } => (destination, true),
+            Kind::SecretFile { destination } => (destination, false),
+        };
         match Location::destination(destination, false).and_then(|file| file.regular_file()) {
-            Ok(_) => Status::Installed,
-            Err(PathError::Missing(_)) => Status::NotInstalled,
+            Ok(_) if template => Status::Installed,
+            Ok(stat) if stat.st_size != 0 => Status::Set,
+            Err(PathError::Missing(_)) if template => Status::NotInstalled,
+            Ok(_) | Err(PathError::Missing(_)) => Status::NotSet,
             Err(error @ PathError::Blocked(..)) => Status::Blocked(error),
             Err(error) => Status::Unknown(error),
         }
@@ -66,7 +77,7 @@ impl App {
         Ok(entry)
     }
 
-    pub fn perform(&self, id: &str, action: Action) -> Result<&'static str, String> {
+    pub fn perform(&self, id: &str, action: Action<'_>) -> Result<&'static str, String> {
         let entry = self.entry(id)?;
         match (action, &entry.kind) {
             (
@@ -83,6 +94,7 @@ impl App {
                         return Err(format!("install {id:?}: Blocked: {error}"));
                     }
                     Status::Unknown(error) => return Err(format!("install {id:?}: {error}")),
+                    _ => unreachable!("template has a template status"),
                 }
                 let install = || {
                     let input =
@@ -95,6 +107,27 @@ impl App {
                     Err(error) => Err(format!("install {id:?}: {error}")),
                 }
             }
+            (Action::Set(input), Kind::SecretFile { destination }) => {
+                let mut bytes = Vec::new();
+                input
+                    .read_to_end(&mut bytes)
+                    .map_err(|error| format!("set {id:?}: read secret input: {error}"))?;
+                if bytes.is_empty() {
+                    return Err(format!("set {id:?}: secret input is empty"));
+                }
+                let write = || {
+                    Location::destination(destination, true)?
+                        .lock()?
+                        .write_file(&bytes[..])
+                };
+                write().map_err(|error| match error {
+                    PathError::Blocked(..) => format!("set {id:?}: Blocked: {error}"),
+                    _ => format!("set {id:?}: {error}"),
+                })?;
+                Ok("Set")
+            }
+            (Action::Install, _) => Err(format!("install does not match entry {id:?}")),
+            (Action::Set(_), _) => Err(format!("set does not match entry {id:?}")),
         }
     }
 }

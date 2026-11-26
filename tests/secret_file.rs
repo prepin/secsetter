@@ -1,0 +1,294 @@
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::fs::{Mode, OFlags, open};
+use rustix::io::{FdFlags, fcntl_setfd};
+use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+use rustix::termios::{Winsize, tcsetwinsize};
+
+struct Fixture {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir(root.join("secsetter")).unwrap();
+        fs::write(
+            root.join("secsetter/config.toml"),
+            r#"
+[[entries]]
+id = "token"
+label = "Token file"
+kind = "secret-file"
+destination = "$XDG_CONFIG_HOME/secrets/token"
+"#,
+        )
+        .unwrap();
+        Self { _dir: dir, root }
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_secsetter"));
+        command.env("XDG_CONFIG_HOME", &self.root);
+        command
+    }
+
+    fn destination(&self) -> PathBuf {
+        self.root.join("secrets/token")
+    }
+
+    fn set(&self, input: &[u8]) -> Output {
+        let mut child = self
+            .command()
+            .args(["set", "token"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn list(&self) -> String {
+        success(self.command().arg("list").output().unwrap())
+    }
+}
+
+fn success(output: Output) -> String {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn assert_private_file(path: &Path, expected: &[u8]) {
+    assert_eq!(fs::read(path).unwrap(), expected);
+    assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn sets_and_replaces_a_whole_file_without_changing_the_input_bytes() {
+    let config = Fixture::new();
+    let destination = config.destination();
+    assert!(config.list().contains("Not set"));
+
+    let first = b"  synthetic-secret\0\xff\r\n";
+    let output = success(config.set(first));
+    assert!(!output.contains("synthetic-secret"));
+    assert_private_file(&destination, first);
+    assert!(config.list().contains("\tSet\n"));
+
+    fs::write(&destination, b"").unwrap();
+    assert!(config.list().contains("Not set"));
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o644)).unwrap();
+    let old_metadata = fs::metadata(&destination).unwrap();
+    let second = b" \n";
+    success(config.set(second));
+    assert_private_file(&destination, second);
+    let new_metadata = fs::metadata(&destination).unwrap();
+    assert_eq!(new_metadata.uid(), old_metadata.uid());
+    assert_ne!(new_metadata.ino(), old_metadata.ino());
+}
+
+#[test]
+fn refuses_empty_input_and_unsafe_destinations_without_revealing_secrets() {
+    let config = Fixture::new();
+    let destination = config.destination();
+    let old = b"old-secret-value";
+    let incoming = b"incoming-secret-value";
+    success(config.set(old));
+    assert_failure(config.set(b""), "secret input is empty");
+    assert_private_file(&destination, old);
+
+    let target = config.root.join("target");
+    fs::rename(&destination, &target).unwrap();
+    symlink(&target, &destination).unwrap();
+    assert!(config.list().contains("Blocked"));
+    assert_failure(config.set(incoming), "Blocked");
+    assert!(destination.is_symlink());
+    assert_private_file(&target, old);
+
+    fs::remove_file(&destination).unwrap();
+    fs::create_dir(&destination).unwrap();
+    assert!(config.list().contains("Blocked"));
+    assert_failure(config.set(incoming), "expected a regular file");
+    assert!(destination.is_dir());
+    fs::remove_dir(&destination).unwrap();
+
+    let outside = config.root.join("outside");
+    fs::rename(destination.parent().unwrap(), &outside).unwrap();
+    fs::rename(&target, outside.join("token")).unwrap();
+    symlink(&outside, destination.parent().unwrap()).unwrap();
+    assert!(config.list().contains("Blocked"));
+    assert_failure(config.set(incoming), "symbolic link");
+    assert_private_file(&outside.join("token"), old);
+
+    let output = config
+        .command()
+        .args(["set", "token", "incoming-secret-value"])
+        .output()
+        .unwrap();
+    assert_failure(output, "usage");
+}
+
+fn assert_failure(output: Output, expected: &str) {
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains(expected), "{stderr}");
+    assert!(!stderr.contains("secret-value"));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn cli_set_rejects_terminal_stdin() {
+    let config = Fixture::new();
+    let (_master, slave) = terminal();
+    let output = config
+        .command()
+        .args(["set", "token"])
+        .stdin(slave)
+        .output()
+        .unwrap();
+    assert_failure(output, "non-terminal standard input");
+    assert!(!config.destination().exists());
+}
+
+#[test]
+fn tui_masks_a_paste_and_waits_for_explicit_submission() {
+    let config = Fixture::new();
+    let destination = config.destination();
+    let (master, slave) = terminal();
+    let child = config
+        .command()
+        .stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave)
+        .spawn()
+        .unwrap();
+    let mut tui = Tui {
+        master,
+        child,
+        output: Vec::new(),
+        seen: 0,
+    };
+
+    tui.read_through("Token file — Not set");
+    tui.send(b"\r");
+    tui.read_through("Secret (Enter submit, Esc cancel): ");
+
+    // Both kinds of newline, Ctrl-C, and an escape sequence belong to the value.
+    let pasted = "  synthetic-paste\r\nq\x03\x1b[A café\n";
+    tui.send(b"\x1b[200~");
+    tui.send(pasted.as_bytes());
+    tui.send(b"\x1b[201~");
+    tui.read_through("Secret (Enter submit, Esc cancel): *");
+    assert!(!destination.exists());
+
+    tui.send(b"\r");
+    tui.read_through("Token file — Set");
+    assert_private_file(&destination, pasted.as_bytes());
+
+    tui.send(b"\r");
+    tui.read_through("Secret (Enter submit, Esc cancel): ");
+    tui.send(b"discard-me");
+    tui.read_through("Secret (Enter submit, Esc cancel): **********");
+    tui.send(b"\x1b");
+    tui.read_through("Set canceled");
+    assert_private_file(&destination, pasted.as_bytes());
+
+    tui.send(b"\r");
+    tui.read_through("Secret (Enter submit, Esc cancel): ");
+    tui.send(b"\r");
+    tui.read_through("secret input is empty");
+    assert_private_file(&destination, pasted.as_bytes());
+
+    tui.send(b"q");
+    tui.read_through("\x1b[?2004l");
+    assert!(tui.child.wait().unwrap().success());
+    let output = String::from_utf8_lossy(&tui.output);
+    assert!(!output.contains("synthetic-paste"));
+    assert!(!output.contains("discard-me"));
+}
+
+fn terminal() -> (File, File) {
+    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
+    fcntl_setfd(&master, FdFlags::CLOEXEC).unwrap();
+    grantpt(&master).unwrap();
+    unlockpt(&master).unwrap();
+    let slave = open(
+        ptsname(&master, Vec::new()).unwrap().as_c_str(),
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .unwrap();
+    tcsetwinsize(
+        &slave,
+        Winsize {
+            ws_row: 24,
+            ws_col: 100,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        },
+    )
+    .unwrap();
+    (master.into(), slave.into())
+}
+
+struct Tui {
+    master: File,
+    child: Child,
+    output: Vec<u8>,
+    seen: usize,
+}
+
+impl Tui {
+    fn send(&mut self, input: &[u8]) {
+        self.master.write_all(input).unwrap();
+    }
+
+    fn read_through(&mut self, text: &str) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(index) = self.output[self.seen..]
+                .windows(text.len())
+                .position(|bytes| bytes == text.as_bytes())
+            {
+                self.seen += index + text.len();
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout = Timespec {
+                tv_sec: remaining.as_secs() as _,
+                tv_nsec: remaining.subsec_nanos() as _,
+            };
+            let mut poll_fds = [PollFd::new(&self.master, PollFlags::IN)];
+            assert!(
+                poll(&mut poll_fds, Some(&timeout)).unwrap() != 0,
+                "timed out waiting for {text:?} in {:?}",
+                String::from_utf8_lossy(&self.output)
+            );
+            let mut buffer = [0; 1024];
+            let read = self.master.read(&mut buffer).unwrap();
+            assert!(read > 0, "terminal closed before showing {text:?}");
+            self.output.extend_from_slice(&buffer[..read]);
+        }
+    }
+}
+
+impl Drop for Tui {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}

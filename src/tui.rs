@@ -1,7 +1,9 @@
 use std::io::{self, IsTerminal, Write, stdout};
 
 use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
 use crossterm::style::Print;
 use crossterm::terminal::{
     self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
@@ -11,7 +13,7 @@ use crossterm::{execute, queue};
 use unicode_width::UnicodeWidthChar;
 
 use crate::app::{Action, App, Status};
-use crate::config::Entry;
+use crate::config::{Entry, Kind};
 
 struct Screen;
 
@@ -22,15 +24,15 @@ impl Screen {
         }
         enable_raw_mode()?;
         let screen = Self;
-        execute!(stdout(), EnterAlternateScreen, Hide)?;
+        execute!(stdout(), EnterAlternateScreen, Hide, EnableBracketedPaste)?;
         Ok(screen)
     }
 }
 
 impl Drop for Screen {
     fn drop(&mut self) {
+        let _ = execute!(stdout(), DisableBracketedPaste, Show, LeaveAlternateScreen);
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), Show, LeaveAlternateScreen);
     }
 }
 
@@ -79,11 +81,62 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
             KeyCode::Down => selected = (selected + 1).min(entries.len().saturating_sub(1)),
             KeyCode::Enter => {
                 if let Some(entry) = entries.get(selected) {
-                    match app.status(entry) {
-                        Status::NotInstalled => confirm = true,
-                        Status::Installed => notice = "Already installed".into(),
-                        status => notice = status.to_string(),
+                    match &entry.kind {
+                        Kind::Template { .. } => match app.status(entry) {
+                            Status::NotInstalled => confirm = true,
+                            Status::Installed => notice = "Already installed".into(),
+                            status => notice = status.to_string(),
+                        },
+                        Kind::SecretFile { .. } => {
+                            notice = match prompt_secret(|prompt| {
+                                draw(app, &entries, selected, prompt)
+                            })? {
+                                Some(secret) => match app
+                                    .perform(&entry.id, Action::Set(&mut secret.as_bytes()))
+                                {
+                                    Ok(message) => message.to_owned(),
+                                    Err(error) => error,
+                                },
+                                None => "Set canceled".into(),
+                            };
+                        }
                     }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn prompt_secret(
+    mut draw_prompt: impl FnMut(&str) -> io::Result<()>,
+) -> io::Result<Option<String>> {
+    let mut secret = String::new();
+    loop {
+        let (width, _) = terminal::size()?;
+        let count = secret.chars().take(usize::from(width)).count();
+        draw_prompt(&format!(
+            "Secret (Enter submit, Esc cancel): {}",
+            "*".repeat(count)
+        ))?;
+        match event::read()? {
+            Event::Paste(text) => secret.push_str(&text),
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    return Ok(None);
+                }
+                if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Enter => return Ok(Some(secret)),
+                    KeyCode::Esc => return Ok(None),
+                    KeyCode::Backspace => {
+                        secret.pop();
+                    }
+                    KeyCode::Char(character) => secret.push(character),
+                    KeyCode::Tab => secret.push('\t'),
+                    _ => {}
                 }
             }
             _ => {}
@@ -98,7 +151,7 @@ fn draw(app: &App, entries: &[&Entry], selected: usize, prompt: &str) -> io::Res
     let header = if entries.is_empty() {
         "SecSetter — No entries for this platform   Esc quit"
     } else {
-        "SecSetter — ↑/↓ select   Enter install   Esc quit"
+        "SecSetter — ↑/↓ select   Enter open   Esc quit"
     };
     line(&mut out, 0, width, header)?;
     let rows = height.saturating_sub(2);

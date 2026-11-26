@@ -12,4 +12,5 @@ toml = "1"
 unicode-width = "0.2"
 
 [dev-dependencies]
+rustix = { version = "1", features = ["event", "pty", "termios"] }
 tempfile = "3"
