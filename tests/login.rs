@@ -306,7 +306,12 @@ fn tui_returns_to_the_list_when_the_executable_is_missing() {
 fn tui_stops_on_ctrl_c_even_if_the_step_exits_successfully_and_restores_terminal_modes() {
     let config = ConfigDir::new(&INTERACTIVE_LOGIN.replace(
         "printf 'Synthetic prompt",
-        "trap 'echo Caught interrupt; exit 0' INT\nstty -echo </dev/tty\nprintf 'Synthetic prompt",
+        "trap 'echo Caught interrupt; exit 0' INT\n\
+         if [ ! -f \"$XDG_CONFIG_HOME/login-started\" ]; then\n\
+         : > \"$XDG_CONFIG_HOME/login-started\"\n\
+         stty -echo </dev/tty\n\
+         fi\n\
+         printf 'Synthetic prompt",
     ));
     let mut pty = Terminal::launch(config.command());
     pty.expect("Synthetic sign-in");
@@ -320,9 +325,14 @@ fn tui_stops_on_ctrl_c_even_if_the_step_exits_successfully_and_restores_terminal
     let result = pty.expect("interrupted");
     assert!(result.contains("Caught interrupt"));
     assert!(result.contains("\x1b[?1049h") && result.contains("Synthetic sign-in"));
-    pty.quit();
+    // Check the next handoff before macOS revokes the session's terminal on exit.
+    pty.send(b"\r");
+    pty.expect("Synthetic prompt: ");
     let restored_modes = tcgetattr(&pty.slave).unwrap().local_modes;
     assert!(restored_modes.contains(LocalModes::ECHO | LocalModes::ICANON | LocalModes::ISIG));
+    pty.send(b"\x03");
+    pty.expect("interrupted");
+    pty.quit();
 }
 
 #[test]
