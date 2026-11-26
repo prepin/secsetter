@@ -1,0 +1,252 @@
+use std::fs;
+use std::path::PathBuf;
+use std::process::{Command, Output};
+
+struct ConfigDir {
+    _temp: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl ConfigDir {
+    fn new(config: &str) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        // macOS exposes its temporary directories through symlinked paths.
+        let root = temp.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("secsetter/templates")).unwrap();
+        fs::write(root.join("secsetter/config.toml"), config).unwrap();
+        Self { _temp: temp, root }
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_secsetter"));
+        command.env("XDG_CONFIG_HOME", &self.root);
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.command().args(args).output().unwrap()
+    }
+}
+
+const WIDGET: &str = r#"
+[[entries]]
+id = "vpn-widget"
+label = "VPN widget config"
+kind = "template"
+source = "widget.json"
+destination = "$XDG_CONFIG_HOME/widget/config.json"
+"#;
+
+fn stdout(output: Output) -> String {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn installs_a_missing_template_and_preserves_an_installed_destination() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let config = ConfigDir::new(WIDGET);
+    let bytes = b"{\"literal\":\"$XDG_CONFIG_HOME\"}\n\0\xff";
+    fs::write(config.root.join("secsetter/templates/widget.json"), bytes).unwrap();
+    let destination = config.root.join("widget/config.json");
+
+    let list = stdout(config.run(&["list"]));
+    assert!(list.contains("vpn-widget") && list.contains("VPN widget config"));
+    assert!(list.contains("Not installed"));
+
+    stdout(config.run(&["install", "vpn-widget"]));
+    assert_eq!(fs::read(&destination).unwrap(), bytes);
+    assert_eq!(
+        fs::metadata(destination.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert!(stdout(config.run(&["list"])).contains("Installed"));
+
+    fs::write(&destination, b"local config").unwrap();
+    fs::remove_file(config.root.join("secsetter/templates/widget.json")).unwrap();
+    assert!(stdout(config.run(&["install", "vpn-widget"])).contains("installed"));
+    assert_eq!(fs::read(destination).unwrap(), b"local config");
+}
+
+#[test]
+fn lists_applicable_entries_in_order_and_checks_commands() {
+    let other_platform = if cfg!(target_os = "linux") {
+        "macos"
+    } else {
+        "linux"
+    };
+    let other = WIDGET.replace("vpn-widget", "other-platform").replace(
+        "kind = \"template\"",
+        &format!("kind = \"template\"\nplatforms = [\"{other_platform}\"]"),
+    );
+    let second = WIDGET.replace("vpn-widget", "another-widget");
+    let config = ConfigDir::new(&format!("{WIDGET}{other}{second}"));
+
+    let list = stdout(config.run(&["list"]));
+    let mut lines = list.lines();
+    assert!(lines.next().unwrap().starts_with("vpn-widget\t"));
+    assert!(lines.next().unwrap().starts_with("another-widget\t"));
+    assert!(lines.next().is_none());
+    fails(config.run(&["install", "unknown"]), "unknown entry ID");
+    fails(config.run(&["install", "other-platform"]), "does not apply");
+    fails(config.run(&["set", "vpn-widget"]), "does not match");
+    fails(
+        config.run(&["restore", "vpn-widget", "--replace"]),
+        "does not match",
+    );
+}
+
+#[test]
+fn reads_the_default_config_when_xdg_is_unset_or_empty() {
+    let config = ConfigDir::new(&WIDGET.replace("$XDG_CONFIG_HOME/", "~/"));
+    fs::create_dir(config.root.join(".config")).unwrap();
+    fs::rename(
+        config.root.join("secsetter"),
+        config.root.join(".config/secsetter"),
+    )
+    .unwrap();
+    fs::write(
+        config.root.join(".config/secsetter/templates/widget.json"),
+        b"widget",
+    )
+    .unwrap();
+
+    let mut command = config.command();
+    command
+        .env_remove("XDG_CONFIG_HOME")
+        .env("HOME", &config.root);
+    assert!(
+        stdout(command.args(["install", "vpn-widget"]).output().unwrap()).contains("Installed")
+    );
+    assert_eq!(
+        fs::read(config.root.join("widget/config.json")).unwrap(),
+        b"widget"
+    );
+
+    let mut command = config.command();
+    command.env("XDG_CONFIG_HOME", "").env("HOME", &config.root);
+    assert!(stdout(command.arg("list").output().unwrap()).contains("Installed"));
+}
+
+#[test]
+fn rejects_invalid_config_before_installing() {
+    let invalid = [
+        format!("{WIDGET}\n[[broken\nsensitive-parser-excerpt"),
+        format!("{WIDGET}{WIDGET}"),
+        format!(
+            "{WIDGET}{}",
+            WIDGET
+                .replace("vpn-widget", "invalid")
+                .replace("\"template\"", "\"unknown\"")
+        ),
+        format!(
+            "{WIDGET}{}",
+            WIDGET
+                .replace("vpn-widget", "invalid")
+                .replace("source = \"widget.json\"", "")
+        ),
+        WIDGET.replace("\"widget.json\"", "\"../unconfined.json\""),
+    ];
+    for contents in invalid {
+        let config = ConfigDir::new(&contents);
+        fs::write(
+            config.root.join("secsetter/templates/widget.json"),
+            b"widget",
+        )
+        .unwrap();
+        let error = fails(config.run(&["install", "vpn-widget"]), "invalid");
+        assert!(!error.contains("sensitive-parser-excerpt"));
+        assert!(!config.root.join("widget").exists());
+    }
+}
+
+#[test]
+fn lists_unsafe_destinations_as_blocked_and_leaves_them_intact() {
+    use std::os::unix::fs::symlink;
+
+    let config = ConfigDir::new(WIDGET);
+    let outside = config.root.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("config.json"), b"existing").unwrap();
+    fs::write(
+        config.root.join("secsetter/templates/widget.json"),
+        b"template",
+    )
+    .unwrap();
+
+    let parent = config.root.join("widget");
+    symlink(&outside, &parent).unwrap();
+    assert!(stdout(config.run(&["list"])).contains("Blocked"));
+    fails(config.run(&["install", "vpn-widget"]), "Blocked");
+    assert!(parent.is_symlink());
+    assert_eq!(fs::read(outside.join("config.json")).unwrap(), b"existing");
+
+    fs::remove_file(&parent).unwrap();
+    fs::create_dir(&parent).unwrap();
+    let destination = parent.join("config.json");
+    symlink(outside.join("absent"), &destination).unwrap();
+    assert!(stdout(config.run(&["list"])).contains("Blocked"));
+    fails(config.run(&["install", "vpn-widget"]), "Blocked");
+    assert!(destination.is_symlink() && !outside.join("absent").exists());
+
+    fs::remove_file(&destination).unwrap();
+    fs::create_dir(&destination).unwrap();
+    assert!(stdout(config.run(&["list"])).contains("Blocked"));
+    fails(config.run(&["install", "vpn-widget"]), "Blocked");
+    assert!(destination.is_dir());
+}
+
+#[test]
+fn refuses_template_links_that_escape_the_template_directory() {
+    use std::os::unix::fs::symlink;
+
+    let config = ConfigDir::new(WIDGET);
+    let templates = config.root.join("secsetter/templates");
+    let outside = config.root.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("widget.json"), b"must not copy").unwrap();
+    symlink(outside.join("widget.json"), templates.join("widget.json")).unwrap();
+    fails(config.run(&["install", "vpn-widget"]), "symbolic link");
+    assert!(!config.root.join("widget").exists());
+
+    fs::remove_file(templates.join("widget.json")).unwrap();
+    fs::remove_dir(&templates).unwrap();
+    symlink(&outside, &templates).unwrap();
+    fails(config.run(&["install", "vpn-widget"]), "symbolic link");
+    assert!(!config.root.join("widget").exists());
+}
+
+#[test]
+fn list_succeeds_when_a_destination_cannot_be_inspected() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let config = ConfigDir::new(WIDGET);
+    let parent = config.root.join("widget");
+    fs::create_dir(&parent).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+    let list = config.run(&["list"]);
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(stdout(list).contains("Unknown"));
+}
+
+fn fails(output: Output, message: &str) -> String {
+    assert!(!output.status.success(), "unexpected success: {output:?}");
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        error.contains(message),
+        "{error:?} did not contain {message:?}"
+    );
+    error
+}
