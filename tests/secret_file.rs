@@ -369,34 +369,34 @@ fn tui_masks_a_paste_and_waits_for_explicit_submission() {
     let destination = config.destination();
     let mut tui = config.open_tui();
 
-    tui.read_through("Token file — Not set");
+    tui.read_through("○ Not set");
     tui.send(b"\r");
-    tui.read_through("Secret (Enter submit, Esc cancel): ");
+    tui.read_through("Enter submit   Esc cancel");
 
     // Both kinds of newline, Ctrl-C, and an escape sequence belong to the value.
     let pasted = "  synthetic-paste\r\nq\x03\x1b[A café\n";
     tui.send(b"\x1b[200~");
     tui.send(pasted.as_bytes());
     tui.send(b"\x1b[201~");
-    tui.read_through("Secret (Enter submit, Esc cancel): *");
+    tui.read_through("*****");
     assert!(!destination.exists());
 
     tui.send(b"\r");
-    tui.read_through("Token file — Set");
+    tui.read_through("✓ Set");
     assert_private_file(&destination, pasted.as_bytes());
 
     tui.send(b"\r");
-    tui.read_through("Secret (Enter submit, Esc cancel): ");
-    tui.send(b"discard-me");
-    tui.read_through("Secret (Enter submit, Esc cancel): **********");
+    tui.read_through("Enter submit   Esc cancel");
+    tui.send(b"\x1b[200~discard-me\x1b[201~");
+    tui.read_through("**********");
     tui.send(b"\x1b");
-    tui.read_through("Set canceled");
+    tui.read_through("canceled");
     assert_private_file(&destination, pasted.as_bytes());
 
     tui.send(b"\r");
-    tui.read_through("Secret (Enter submit, Esc cancel): ");
+    tui.read_through("Enter submit   Esc cancel");
     tui.send(b"\r");
-    tui.read_through("secret input is empty");
+    tui.read_through("empty");
     assert_private_file(&destination, pasted.as_bytes());
 
     tui.send(b"q");
@@ -426,22 +426,22 @@ key = ["token"]
     fs::write(&path, original).unwrap();
     let mut tui = config.open_tui();
 
-    tui.read_through("GitLab token — Set");
+    tui.read_through("✓ Set");
     tui.send(b"\r");
-    tui.read_through("Secret (Enter submit, Esc cancel): ");
-    tui.send(b"discard-me");
-    tui.read_through("Secret (Enter submit, Esc cancel): **********");
+    tui.read_through("Enter submit   Esc cancel");
+    tui.send(b"\x1b[200~discard-me\x1b[201~");
+    tui.read_through("**********");
     tui.send(b"\x1b");
-    tui.read_through("Set canceled");
+    tui.read_through("canceled");
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
 
     tui.send(b"\r");
-    tui.read_through("Secret (Enter submit, Esc cancel): ");
+    tui.read_through("Enter submit   Esc cancel");
     tui.send(b"\x1b[200~new-synthetic-token\n\x1b[201~");
-    tui.read_through("Secret (Enter submit, Esc cancel): ********************");
+    tui.read_through("********************");
     assert_eq!(fs::read_to_string(&path).unwrap(), original);
     tui.send(b"\r");
-    tui.read_through("GitLab token — Set");
+    tui.read_through("Set");
     let edited = fs::read_to_string(path).unwrap();
     assert!(edited.contains("# keep"));
     assert_eq!(
@@ -463,6 +463,58 @@ key = ["token"]
 }
 
 #[test]
+fn tui_preserves_the_selected_entry_and_masked_input_through_resize() {
+    let config = Fixture::with_config(
+        r#"
+[[entries]]
+id = "other"
+label = "Other token"
+kind = "secret-file"
+destination = "$XDG_CONFIG_HOME/secrets/other"
+
+[[entries]]
+id = "token"
+label = "Long token name that cannot fit in a compact row"
+kind = "secret-file"
+destination = "$XDG_CONFIG_HOME/secrets/token"
+"#,
+    );
+    let mut tui = config.open_tui();
+    tui.read_through("Selected entry");
+    tui.send(b"\x1b[B");
+    tui.read_through("› Long token");
+    tui.send(b"\r");
+    tui.read_through("Enter submit   Esc cancel");
+    tui.send(b"\x1b[200~demo-abc\x1b[201~");
+    tui.read_through("********");
+
+    tui.resize(32, 8);
+    tui.read_through("› Long token…");
+    tui.read_through("○ Not set");
+    tui.read_through("********");
+    tui.read_through("Enter submit   Esc cancel");
+
+    tui.resize(24, 7);
+    tui.read_through("Resize to 32×8");
+    tui.read_through("\x1b[?25l");
+    tui.send(b"\r");
+    tui.read_through("\x1b[?25l");
+    assert!(!config.destination().exists());
+
+    tui.resize(100, 24);
+    tui.read_through("Selected entry");
+    tui.read_through("********");
+    tui.read_through("Enter submit   Esc cancel");
+    tui.send(b"\r");
+    tui.read_through("✓ Set");
+    assert_private_file(&config.destination(), b"demo-abc");
+    assert!(!config.root.join("secrets/other").exists());
+    assert!(!String::from_utf8_lossy(&tui.output).contains("demo-abc"));
+    tui.send(b"q");
+    assert!(tui.child.wait().unwrap().success());
+}
+
+#[test]
 fn tui_restores_a_missing_file_and_asks_before_replacing_an_empty_file() {
     let config = Fixture::with_config(FNOX_CONFIG);
     config.fnox_stub(r#"printf 'synthetic-fnox\n'"#);
@@ -470,7 +522,7 @@ fn tui_restores_a_missing_file_and_asks_before_replacing_an_empty_file() {
     let called = config.root.join("fnox-called");
     let mut tui = config.open_tui();
 
-    tui.read_through("VPN profile — Not set");
+    tui.read_through("○ Not set");
     tui.send(b"\r");
     tui.read_through("Restored");
     assert_private_file(&destination, b"synthetic-fnox\n");
@@ -478,17 +530,19 @@ fn tui_restores_a_missing_file_and_asks_before_replacing_an_empty_file() {
     fs::write(&destination, b"").unwrap();
     fs::remove_file(&called).unwrap();
     tui.send(b"\r");
-    tui.read_through("Replace VPN profile? [y/N]");
+    tui.read_through("Replace VPN profile?");
+    tui.read_through("[y/N]");
     assert!(!called.exists());
     tui.send(b"\r");
-    tui.read_through("Replace canceled");
+    tui.read_through("canceled");
     assert!(!called.exists());
     assert_eq!(fs::read(&destination).unwrap(), b"");
 
     tui.send(b"\r");
-    tui.read_through("Replace VPN profile? [y/N]");
+    tui.read_through("Replace VPN profile?");
+    tui.read_through("[y/N]");
     tui.send(b"y");
-    tui.read_through("VPN profile — Set");
+    tui.read_through("✓ Set");
     tui.read_through("Restored");
     assert_private_file(&destination, b"synthetic-fnox\n");
     assert!(!String::from_utf8_lossy(&tui.output).contains("synthetic-fnox"));
@@ -530,6 +584,25 @@ struct Tui {
 impl Tui {
     fn send(&mut self, input: &[u8]) {
         self.master.write_all(input).unwrap();
+    }
+
+    fn resize(&self, width: u16, height: u16) {
+        tcsetwinsize(
+            &self.master,
+            Winsize {
+                ws_row: height,
+                ws_col: width,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            },
+        )
+        .unwrap();
+        // This PTY does not make the child a foreground process group.
+        // SAFETY: The child is still running and SIGWINCH is a valid signal.
+        assert_eq!(
+            unsafe { libc::kill(self.child.id() as i32, libc::SIGWINCH) },
+            0
+        );
     }
 
     fn read_through(&mut self, text: &str) {

@@ -1,4 +1,4 @@
-use std::io::{self, IsTerminal, stdout};
+use std::io::{self, IsTerminal, Stdout, stdout};
 use std::{mem, ptr};
 
 use crossterm::cursor::{Hide, Show};
@@ -7,10 +7,12 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use ratatui::{Frame, Terminal, backend::CrosstermBackend};
 use rustix::termios::{OptionalActions, tcgetattr, tcsetattr};
 
 pub(super) struct Screen {
     active: bool,
+    terminal: Terminal<CrosstermBackend<Stdout>>,
 }
 
 impl Screen {
@@ -18,9 +20,18 @@ impl Screen {
         if !io::stdin().is_terminal() || !stdout().is_terminal() {
             return Err(io::Error::other("the TUI requires a terminal"));
         }
-        let mut screen = Self { active: false };
+        let mut screen = Self {
+            active: false,
+            terminal: Terminal::new(CrosstermBackend::new(stdout()))?,
+        };
         screen.resume()?;
         Ok(screen)
+    }
+
+    pub(super) fn draw(&mut self, draw: impl FnOnce(&mut Frame) -> bool) -> io::Result<bool> {
+        let mut usable = false;
+        self.terminal.draw(|frame| usable = draw(frame))?;
+        Ok(usable)
     }
 
     pub(super) fn with_terminal<T>(&mut self, operation: impl FnOnce() -> T) -> io::Result<T> {
@@ -36,7 +47,9 @@ impl Screen {
     fn resume(&mut self) -> io::Result<()> {
         enable_raw_mode()?;
         self.active = true;
-        execute!(stdout(), EnterAlternateScreen, Hide, EnableBracketedPaste)
+        execute!(stdout(), EnterAlternateScreen, Hide, EnableBracketedPaste)?;
+        // The alternate screen needs a full repaint after a terminal handoff.
+        self.terminal.resize(self.terminal.size()?.into())
     }
 
     fn leave(&mut self) -> io::Result<()> {

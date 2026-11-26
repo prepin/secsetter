@@ -1,19 +1,16 @@
 mod screen;
+mod view;
 
-use std::io::{self, Write, stdout};
+use std::io;
 use std::os::unix::process::ExitStatusExt;
 
-use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::queue;
-use crossterm::style::Print;
-use crossterm::terminal::{self, Clear, ClearType};
-use unicode_width::UnicodeWidthChar;
 
 use crate::app::{Action, App, RestoreDestination, Status, restore_destination};
 use crate::config::{Entry, Kind};
 use crate::login;
 use screen::Screen;
+use view::{Panel, View};
 
 pub(crate) fn run(app: &App) -> io::Result<()> {
     let mut screen = Screen::enter()?;
@@ -23,15 +20,20 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
     let login_start = (!logins.is_empty()).then_some(entries.len());
     entries.extend(logins);
     let mut selected = 0;
-    let mut confirm = None;
+    let mut confirm: Option<(&str, Action<'_>)> = None;
     let mut notice = String::new();
     loop {
-        let prompt = if let Some((verb, _)) = &confirm {
-            format!("{verb} {}? [y/N]", entries[selected].label)
-        } else {
-            notice.clone()
+        let view = View {
+            app,
+            entries: &entries,
+            login_start,
+            selected,
         };
-        draw(app, &entries, login_start, selected, &prompt)?;
+        let panel = match &confirm {
+            Some((verb, _)) => Panel::Confirm(verb),
+            None => Panel::Notice(&notice),
+        };
+        let usable = screen.draw(|frame| view.render(frame, panel))?;
         let Event::Key(key) = event::read()? else {
             continue;
         };
@@ -40,6 +42,13 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(());
+        }
+        if !usable {
+            match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Char('q') if confirm.is_none() => return Ok(()),
+                _ => continue,
+            }
         }
         if let Some((verb, action)) = confirm.take() {
             match key.code {
@@ -55,8 +64,17 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
-            KeyCode::Up => selected = selected.saturating_sub(1),
-            KeyCode::Down => selected = (selected + 1).min(entries.len().saturating_sub(1)),
+            KeyCode::Up | KeyCode::Down => {
+                let next = if key.code == KeyCode::Up {
+                    selected.saturating_sub(1)
+                } else {
+                    (selected + 1).min(entries.len().saturating_sub(1))
+                };
+                if next != selected {
+                    selected = next;
+                    notice.clear();
+                }
+            }
             KeyCode::Enter => {
                 if let Some(entry) = entries.get(selected) {
                     match &entry.kind {
@@ -69,9 +87,7 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
                             status => notice = status.to_string(),
                         },
                         Kind::SecretFile { .. } | Kind::SecretField { .. } => {
-                            notice = match prompt_secret(|prompt| {
-                                draw(app, &entries, login_start, selected, prompt)
-                            })? {
+                            notice = match prompt_secret(&mut screen, &view)? {
                                 Some(secret) => perform(
                                     app,
                                     &mut screen,
@@ -126,19 +142,15 @@ fn perform(
     Ok(result.map_or_else(|error| error, str::to_owned))
 }
 
-fn prompt_secret(
-    mut draw_prompt: impl FnMut(&str) -> io::Result<()>,
-) -> io::Result<Option<String>> {
+fn prompt_secret(screen: &mut Screen, view: &View<'_>) -> io::Result<Option<String>> {
     let mut secret = String::new();
     loop {
-        let (width, _) = terminal::size()?;
-        let count = secret.chars().take(usize::from(width)).count();
-        draw_prompt(&format!(
-            "Secret (Enter submit, Esc cancel): {}",
-            "*".repeat(count)
-        ))?;
+        let usable = screen.draw(|frame| {
+            let count = secret.chars().take(usize::from(frame.area().width)).count();
+            view.render(frame, Panel::Secret(count))
+        })?;
         match event::read()? {
-            Event::Paste(text) => secret.push_str(&text),
+            Event::Paste(text) if usable => secret.push_str(&text),
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     return Ok(None);
@@ -147,8 +159,9 @@ fn prompt_secret(
                     continue;
                 }
                 match key.code {
-                    KeyCode::Enter => return Ok(Some(secret)),
                     KeyCode::Esc => return Ok(None),
+                    _ if !usable => {}
+                    KeyCode::Enter => return Ok(Some(secret)),
                     KeyCode::Backspace => {
                         secret.pop();
                     }
@@ -175,63 +188,4 @@ fn run_login(screen: &mut Screen, command: &[String]) -> io::Result<String> {
         Ok(status) => format!("Login failed: {status}"),
         Err(error) => format!("Could not run login: {error}"),
     })
-}
-
-fn draw(
-    app: &App,
-    entries: &[&Entry],
-    login_start: Option<usize>,
-    selected: usize,
-    prompt: &str,
-) -> io::Result<()> {
-    let (width, height) = terminal::size()?;
-    let mut out = stdout().lock();
-    queue!(out, Clear(ClearType::All))?;
-    let header = if entries.is_empty() {
-        "SecSetter — No entries for this platform   Esc quit"
-    } else {
-        "SecSetter — ↑/↓ select   Enter open   Esc quit"
-    };
-    line(&mut out, 0, width, header)?;
-    let rows = height.saturating_sub(2);
-    let selected_row = selected + usize::from(login_start.is_some_and(|start| selected >= start));
-    let first = selected_row.saturating_sub(usize::from(rows.saturating_sub(1)));
-    for (row, index) in (1..=rows).zip(first..) {
-        if Some(index) == login_start {
-            line(&mut out, row, width, "Login")?;
-            continue;
-        }
-        let entry_index = index - usize::from(login_start.is_some_and(|start| index > start));
-        let Some(entry) = entries.get(entry_index) else {
-            break;
-        };
-        let mark = if entry_index == selected { ">" } else { " " };
-        let label = &entry.label;
-        let text = match app.status(entry) {
-            Status::Untracked => format!("{mark} {label}"),
-            status => format!("{mark} {label} — {status}"),
-        };
-        line(&mut out, row, width, &text)?;
-    }
-    if !prompt.is_empty() {
-        line(&mut out, height.saturating_sub(1), width, prompt)?;
-    }
-    out.flush()
-}
-
-fn line(out: &mut impl Write, row: u16, width: u16, text: &str) -> io::Result<()> {
-    let mut available = usize::from(width.saturating_sub(1));
-    let visible: String = text
-        .chars()
-        .filter(|character| !character.is_control())
-        .take_while(|character| {
-            let columns = character.width().unwrap_or(0);
-            if columns > available {
-                return false;
-            }
-            available -= columns;
-            true
-        })
-        .collect();
-    queue!(out, MoveTo(0, row), Print(visible))
 }

@@ -8,6 +8,7 @@ crossterm = "0.29"
 getrandom = "0.4"
 libc = "0.2"
 oneyaml = "1.2"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "layout-cache"] }
 rustix = { version = "1", features = ["fs", "net", "process", "termios"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

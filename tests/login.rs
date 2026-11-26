@@ -134,19 +134,16 @@ printf 'Read answer\n'
 fn tui_returns_to_the_list_after_an_interactive_login_succeeds() {
     let config = ConfigDir::new(&format!("{INTERACTIVE_LOGIN}{TEMPLATE}"));
     let mut pty = Terminal::launch(config.command());
-    assert!(
-        pty.expect("> Example config — Not installed")
-            .contains("\x1b[?2004h")
-    );
-    assert!(pty.expect("Synthetic sign-in").contains("Login"));
+    assert!(pty.expect("○ Not installed").contains("\x1b[?2004h"));
+    assert!(pty.expect("sign-in").contains("Login"));
 
     pty.send(b"\x1b[B");
-    pty.expect("> Synthetic sign-in");
+    pty.expect("› Synthetic sign-in");
     pty.send(b"\r");
     let suspended = pty.expect("Synthetic prompt: ");
     assert!(suspended.contains("\x1b[?2004l") && suspended.contains("\x1b[?1049l"));
     pty.send(b"synthetic answer\n");
-    let result = pty.expect("Login completed");
+    let result = pty.expect("completed");
     assert!(result.contains("Read answer"));
     assert!(result.contains("\x1b[?2004h"));
     assert!(result.contains("\x1b[?1049h") && result.contains("Synthetic sign-in"));
@@ -162,8 +159,10 @@ fn tui_returns_to_the_list_with_the_command_failure_status() {
     pty.expect("Synthetic prompt: ");
 
     pty.send(b"wrong answer\n");
-    let result = pty.expect("Login failed: exit status: 42");
+    let result = pty.expect("status:");
+    assert!(result.contains("failed:"));
     assert!(result.contains("\x1b[?1049h") && result.contains("Synthetic sign-in"));
+    pty.expect("42");
     pty.quit();
 }
 
@@ -175,7 +174,8 @@ fn tui_returns_to_the_list_when_the_executable_is_missing() {
     pty.expect("Synthetic sign-in");
     pty.send(b"\r");
 
-    let result = pty.expect("Could not run login");
+    let result = pty.expect("login:");
+    assert!(result.contains("Could") && result.contains("run"));
     assert!(result.contains("\x1b[?1049l") && result.contains("\x1b[?1049h"));
     assert!(result.contains("Synthetic sign-in"));
     pty.quit();
@@ -196,7 +196,7 @@ fn tui_returns_to_the_list_after_ctrl_c_and_restores_terminal_modes() {
     assert!(!prompt_modes.contains(LocalModes::ECHO));
 
     pty.send(b"\x03");
-    let result = pty.expect("Login interrupted");
+    let result = pty.expect("interrupted");
     assert!(result.contains("\x1b[?1049h") && result.contains("Synthetic sign-in"));
     pty.quit();
     let restored_modes = tcgetattr(&pty.slave).unwrap().local_modes;
@@ -274,13 +274,13 @@ exit 42
         command
     };
     let mut pty = Terminal::launch(isolated());
-    pty.expect("Synthetic privileged token — Not set");
+    pty.expect("○ Not set");
     for (answer, failure) in [
-        (b"no\n".as_slice(), "exit status: 42"),
-        (b"\x03".as_slice(), "signal: 2"),
+        (b"no\n".as_slice(), "status:"),
+        (b"\x03".as_slice(), "signal:"),
     ] {
         pty.send(b"\r");
-        pty.expect("Secret (Enter submit, Esc cancel): ");
+        pty.expect("Enter submit   Esc cancel");
         pty.send(b"synthetic payload\r");
         let suspended = pty.expect("Synthetic sudo prompt: ");
         assert!(suspended.contains("\x1b[?2004l") && suspended.contains("\x1b[?1049l"));
