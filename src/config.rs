@@ -38,6 +38,9 @@ pub(crate) enum Kind {
         source: PathBuf,
         destination: PathBuf,
     },
+    Login {
+        command: Vec<String>,
+    },
 }
 
 #[derive(Deserialize, PartialEq)]
@@ -107,22 +110,36 @@ impl Config {
             if !ids.insert(id) {
                 return Err(invalid("duplicate id"));
             }
-            if entry.privileged {
-                return Err(invalid("privileged template installs are not supported"));
+            match &mut entry.kind {
+                Kind::Template {
+                    source,
+                    destination,
+                } => {
+                    if entry.privileged {
+                        return Err(invalid("privileged template installs are not supported"));
+                    }
+                    if source.is_absolute()
+                        || source.file_name().is_none()
+                        || source.as_os_str().as_encoded_bytes().contains(&0)
+                        || source.components().any(|part| part == Component::ParentDir)
+                    {
+                        return Err(invalid("source must be a file path inside templates/"));
+                    }
+                    *destination = expand_destination(destination, &config_home)
+                        .map_err(|reason| invalid(&reason))?;
+                }
+                Kind::Login { command } => {
+                    if entry.privileged {
+                        return Err(invalid("login entries cannot be privileged"));
+                    }
+                    if command.first().is_none_or(String::is_empty) {
+                        return Err(invalid("command must start with an executable"));
+                    }
+                    if command.iter().any(|argument| argument.contains('\0')) {
+                        return Err(invalid("command must not contain NUL characters"));
+                    }
+                }
             }
-            let Kind::Template {
-                source,
-                destination,
-            } = &mut entry.kind;
-            if source.is_absolute()
-                || source.file_name().is_none()
-                || source.as_os_str().as_encoded_bytes().contains(&0)
-                || source.components().any(|part| part == Component::ParentDir)
-            {
-                return Err(invalid("source must be a file path inside templates/"));
-            }
-            *destination =
-                expand_destination(destination, &config_home).map_err(|reason| invalid(&reason))?;
         }
         Ok(Self {
             directory,

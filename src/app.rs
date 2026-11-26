@@ -12,6 +12,7 @@ pub(crate) enum Status {
     NotInstalled,
     Blocked(PathError),
     Unknown(PathError),
+    Untracked,
 }
 
 impl fmt::Display for Status {
@@ -21,6 +22,7 @@ impl fmt::Display for Status {
             Self::NotInstalled => f.write_str("Not installed"),
             Self::Blocked(error) => write!(f, "Blocked: {error}"),
             Self::Unknown(error) => write!(f, "Unknown: {error}"),
+            Self::Untracked => Ok(()),
         }
     }
 }
@@ -44,7 +46,10 @@ impl App {
     }
 
     pub fn status(&self, entry: &Entry) -> Status {
-        let Kind::Template { destination, .. } = &entry.kind;
+        let destination = match &entry.kind {
+            Kind::Template { destination, .. } => destination,
+            Kind::Login { .. } => return Status::Untracked,
+        };
         match Location::destination(destination, false).and_then(|file| file.regular_file()) {
             Ok(_) => Status::Installed,
             Err(PathError::Missing(_)) => Status::NotInstalled,
@@ -66,6 +71,13 @@ impl App {
         Ok(entry)
     }
 
+    pub fn login_command(&self, id: &str) -> Result<&[String], String> {
+        match &self.entry(id)?.kind {
+            Kind::Login { command } => Ok(command),
+            _ => Err(format!("login does not match entry {id:?}")),
+        }
+    }
+
     pub fn perform(&self, id: &str, action: Action) -> Result<&'static str, String> {
         let entry = self.entry(id)?;
         match (action, &entry.kind) {
@@ -83,6 +95,7 @@ impl App {
                         return Err(format!("install {id:?}: Blocked: {error}"));
                     }
                     Status::Unknown(error) => return Err(format!("install {id:?}: {error}")),
+                    Status::Untracked => unreachable!("templates have a status"),
                 }
                 let install = || {
                     let input =
@@ -95,6 +108,7 @@ impl App {
                     Err(error) => Err(format!("install {id:?}: {error}")),
                 }
             }
+            _ => Err(format!("install does not match entry {id:?}")),
         }
     }
 }

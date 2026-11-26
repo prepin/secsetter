@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 crossterm = "0.29"
 getrandom = "0.4"
-rustix = { version = "1", features = ["fs", "process"] }
+libc = "0.2"
+rustix = { version = "1", features = ["fs", "process", "termios"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 unicode-width = "0.2"
