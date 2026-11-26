@@ -1,8 +1,10 @@
 mod app;
 mod config;
+mod file_write;
 mod fnox;
 mod login;
 mod paths;
+mod privileged;
 mod secret_field;
 mod tui;
 
@@ -25,6 +27,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let args: Vec<_> = env::args_os().skip(1).collect();
     match args.as_slice() {
+        [command, args @ ..] if command == privileged::HELPER => privileged::run_helper(args)?,
         [] => tui::run(&App::load()?).map_err(|error| format!("terminal: {error}"))?,
         [command] if command == "list" => {
             let app = App::load()?;

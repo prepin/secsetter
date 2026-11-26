@@ -4,13 +4,34 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustix::fs::{self, AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, RenameFlags};
 use rustix::io::Errno;
-use rustix::process::Uid;
+use rustix::process::{Gid, Uid};
 
 const PRIVATE_DIR: Mode = Mode::RWXU;
 const PRIVATE_FILE: Mode = Mode::RUSR.union(Mode::WUSR);
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn handle_write_interrupts() -> io::Result<()> {
+    extern "C" fn interrupt(_: libc::c_int) {
+        INTERRUPTED.store(true, Ordering::Relaxed);
+    }
+
+    // SAFETY: The structures are initialized and the handler only stores an atomic flag.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = interrupt as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            if libc::sigaction(signal, &action, std::ptr::null_mut()) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 pub(crate) enum PathError {
@@ -49,6 +70,7 @@ pub(crate) struct Location<'a> {
     parent: OwnedFd,
     name: &'a OsStr,
     path: PathBuf,
+    ownership: Option<(Uid, Gid)>,
 }
 
 impl<'a> Location<'a> {
@@ -62,6 +84,12 @@ impl<'a> Location<'a> {
         let root = directory(CWD, "/").map_err(|error| PathError::lookup(Path::new("/"), error))?;
         let relative = path.strip_prefix("/").expect("absolute destination");
         Self::within(root, Path::new("/"), relative, create_parents)
+    }
+
+    pub fn privileged(path: &'a Path, ownership: (Uid, Gid)) -> Result<Self, PathError> {
+        let mut location = Self::destination(path, false)?;
+        location.ownership = Some(ownership);
+        Ok(location)
     }
 
     fn within(
@@ -97,7 +125,28 @@ impl<'a> Location<'a> {
             }
             parent = next.map_err(|error| PathError::lookup(&component_path, error))?;
         }
-        Ok(Self { parent, name, path })
+        Ok(Self {
+            parent,
+            name,
+            path,
+            ownership: None,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn check_interrupted(&self) -> Result<(), PathError> {
+        if INTERRUPTED.load(Ordering::Relaxed) {
+            Err(PathError::io(
+                &self.path,
+                "write interrupted for",
+                Errno::INTR,
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     pub fn regular_file(&self) -> Result<fs::Stat, PathError> {
@@ -143,6 +192,7 @@ impl<'a> Location<'a> {
         )
         .map_err(lock_error)?;
         loop {
+            self.check_interrupted()?;
             match fs::flock(&guard, FlockOperation::LockExclusive) {
                 Ok(()) => break,
                 Err(Errno::INTR) => continue,
@@ -156,7 +206,13 @@ impl<'a> Location<'a> {
     }
 
     pub fn create_file(&self, input: impl Read) -> Result<bool, PathError> {
+        match self.regular_file() {
+            Ok(_) => return Ok(false),
+            Err(PathError::Missing(_)) => {}
+            Err(error) => return Err(error),
+        }
         let stage = self.stage_file(input, None)?;
+        self.check_interrupted()?;
         match stage.commit_new(self) {
             Ok(()) => Ok(true),
             Err(Errno::EXIST) => {
@@ -172,6 +228,7 @@ impl<'a> Location<'a> {
         mut input: impl Read,
         owner: Option<Uid>,
     ) -> Result<StagingDir<'_>, PathError> {
+        self.check_interrupted()?;
         let stage = StagingDir::new(self)?;
         let write_error = |error| PathError::io(&self.path, "write temporary file for", error);
         let mut file = File::from(
@@ -184,7 +241,10 @@ impl<'a> Location<'a> {
             .map_err(|error| write_error(error.into()))?,
         );
         io::copy(&mut input, &mut file).map_err(write_error)?;
-        if let Some(owner) = owner.filter(|&owner| owner != rustix::process::geteuid()) {
+        if let Some((owner, group)) = self.ownership {
+            fs::fchown(&file, Some(owner), Some(group))
+                .map_err(|error| write_error(error.into()))?;
+        } else if let Some(owner) = owner.filter(|&owner| owner != rustix::process::geteuid()) {
             fs::fchown(&file, Some(owner), None).map_err(|error| write_error(error.into()))?;
         }
         fs::fchmod(&file, PRIVATE_FILE).map_err(|error| write_error(error.into()))?;
@@ -231,8 +291,10 @@ impl LockedLocation<'_, '_> {
                     "destination changed during write",
                 ));
             }
+            location.check_interrupted()?;
             fs::renameat(&stage.fd, "file", &location.parent, location.name)
         } else {
+            location.check_interrupted()?;
             stage.commit_new(location)
         };
         if commit == Err(Errno::EXIST) {

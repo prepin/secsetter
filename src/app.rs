@@ -3,8 +3,10 @@ use std::io::Read;
 use std::path::Path;
 
 use crate::config::{Config, Entry, Kind};
+use crate::file_write::{FileWrite, Outcome, write_error};
 use crate::fnox;
 use crate::paths::{self, Location, PathError};
+use crate::privileged;
 
 pub(crate) enum Action<'a> {
     Install,
@@ -117,21 +119,24 @@ impl App {
                 match self.status(entry) {
                     Status::Installed => return Ok("Already installed"),
                     Status::NotInstalled => {}
+                    Status::Unknown(_) if entry.ownership().is_some() => {}
                     Status::Blocked(error) => {
                         return Err(format!("install {id:?}: Blocked: {error}"));
                     }
                     Status::Unknown(error) => return Err(format!("install {id:?}: {error}")),
                     _ => unreachable!("template has a template status"),
                 }
-                let install = || {
-                    let input =
-                        paths::open_template(&self.config.directory, &self.config.path, source)?;
-                    Location::destination(destination, true)?.create_file(input)
-                };
-                match install() {
-                    Ok(true) => Ok("Installed"),
-                    Ok(false) => Ok("Already installed"),
-                    Err(error) => Err(format!("install {id:?}: {error}")),
+                let error = |error: String| format!("install {id:?}: {error}");
+                let mut input =
+                    paths::open_template(&self.config.directory, &self.config.path, source)
+                        .map_err(|cause| error(cause.to_string()))?;
+                let mut bytes = Vec::new();
+                input
+                    .read_to_end(&mut bytes)
+                    .map_err(|cause| error(format!("read template {source:?}: {cause}")))?;
+                match write(entry, destination, FileWrite::Create, &bytes).map_err(error)? {
+                    Outcome::Written => Ok("Installed"),
+                    Outcome::AlreadyExists => Ok("Already installed"),
                 }
             }
             (
@@ -140,7 +145,7 @@ impl App {
                     source,
                     destination,
                 },
-            ) => restore_file(id, source, destination, replace),
+            ) => restore_file(entry, source, destination, replace),
             (Action::Set(input), kind @ (Kind::SecretFile { .. } | Kind::SecretField { .. })) => {
                 let mut bytes = Vec::new();
                 input
@@ -149,27 +154,23 @@ impl App {
                 if bytes.is_empty() {
                     return Err(format!("set {id:?}: secret input is empty"));
                 }
-                match kind {
-                    Kind::SecretFile { destination } => {
-                        let write = || {
-                            Location::destination(destination, true)?
-                                .lock()?
-                                .write_file(&bytes[..])
-                        };
-                        write().map_err(|error| match error {
-                            PathError::Blocked(..) => format!("set {id:?}: Blocked: {error}"),
-                            _ => format!("set {id:?}: {error}"),
-                        })?;
-                    }
+                let (destination, operation) = match kind {
+                    Kind::SecretFile { destination } => (destination, FileWrite::Replace),
                     Kind::SecretField {
                         destination,
                         format,
                         key,
-                    } => format
-                        .write(destination, key, &bytes)
-                        .map_err(|error| format!("set {id:?}: {error}"))?,
+                    } => (
+                        destination,
+                        FileWrite::Field {
+                            format: *format,
+                            key: key.clone(),
+                        },
+                    ),
                     _ => unreachable!("set requires a manual secret entry"),
-                }
+                };
+                write(entry, destination, operation, &bytes)
+                    .map_err(|error| format!("set {id:?}: {error}"))?;
                 Ok("Set")
             }
             (Action::Install, _) => Err(format!("install does not match entry {id:?}")),
@@ -179,42 +180,58 @@ impl App {
     }
 }
 
-pub(crate) fn restore_destination_exists(destination: &Path) -> Result<bool, PathError> {
+pub(crate) fn restore_destination_exists(
+    entry: &Entry,
+    destination: &Path,
+) -> Result<Option<bool>, PathError> {
     match Location::destination(destination, false).and_then(|location| location.regular_file()) {
-        Ok(_) => Ok(true),
-        Err(PathError::Missing(_)) => Ok(false),
+        Ok(_) => Ok(Some(true)),
+        Err(PathError::Missing(_)) => Ok(Some(false)),
+        Err(PathError::Io(..)) if entry.ownership().is_some() => Ok(None),
         Err(error) => Err(error),
     }
 }
 
 fn restore_file(
-    id: &str,
+    entry: &Entry,
     source: &str,
     destination: &Path,
     replace: bool,
 ) -> Result<&'static str, String> {
-    let write_error = |error: PathError| match error {
-        PathError::Blocked(..) => format!("restore {id:?}: Blocked: {error}"),
-        _ => format!("restore {id:?}: {error}"),
-    };
+    let id = &entry.id;
+    let restore_error = |error: String| format!("restore {id:?}: {error}");
     let needs_approval = || {
         format!(
             "restore {id:?}: destination already exists; confirm replacement or use --replace: {destination:?}"
         )
     };
-    if restore_destination_exists(destination).map_err(write_error)? && !replace {
+    let exists = restore_destination_exists(entry, destination)
+        .map_err(|error| restore_error(write_error(error)))?;
+    if exists == Some(true) && !replace {
         return Err(needs_approval());
     }
-    let bytes = fnox::fetch(source).map_err(|error| format!("restore {id:?}: {error}"))?;
-    let location = Location::destination(destination, true).map_err(write_error)?;
-    let locked = location.lock().map_err(write_error)?;
-    if replace {
-        locked.write_file(bytes.as_slice()).map_err(write_error)?;
-    } else if !location
-        .create_file(bytes.as_slice())
-        .map_err(write_error)?
+    let bytes = fnox::fetch(source).map_err(restore_error)?;
+    let operation = if replace {
+        FileWrite::Replace
+    } else {
+        FileWrite::Create
+    };
+    if write(entry, destination, operation, &bytes).map_err(restore_error)?
+        == Outcome::AlreadyExists
     {
         return Err(needs_approval());
     }
     Ok("Restored")
+}
+
+fn write(
+    entry: &Entry,
+    destination: &Path,
+    operation: FileWrite,
+    bytes: &[u8],
+) -> Result<Outcome, String> {
+    match entry.ownership() {
+        Some(ownership) => privileged::write(&operation, destination, ownership, bytes),
+        None => operation.apply(destination, None, bytes),
+    }
 }

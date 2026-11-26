@@ -62,6 +62,9 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
                     match &entry.kind {
                         Kind::Template { .. } => match app.status(entry) {
                             Status::NotInstalled => confirm = Some(("Install", Action::Install)),
+                            Status::Unknown(_) if entry.ownership().is_some() => {
+                                confirm = Some(("Install", Action::Install));
+                            }
                             Status::Installed => notice = "Already installed".into(),
                             status => notice = status.to_string(),
                         },
@@ -69,21 +72,27 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
                             notice = match prompt_secret(|prompt| {
                                 draw(app, &entries, login_start, selected, prompt)
                             })? {
-                                Some(secret) => match app
-                                    .perform(&entry.id, Action::Set(&mut secret.as_bytes()))
-                                {
-                                    Ok(message) => message.to_owned(),
-                                    Err(error) => error,
-                                },
+                                Some(secret) => perform(
+                                    app,
+                                    &mut screen,
+                                    entry,
+                                    Action::Set(&mut secret.as_bytes()),
+                                )?,
                                 None => "Set canceled".into(),
                             };
                         }
                         Kind::FnoxFile { destination, .. } => {
-                            match restore_destination_exists(destination) {
-                                Ok(true) => {
+                            match restore_destination_exists(entry, destination) {
+                                Ok(Some(true)) => {
                                     confirm = Some(("Replace", Action::Restore { replace: true }));
                                 }
-                                Ok(false) => {
+                                Ok(None) => {
+                                    confirm = Some((
+                                        "Restore or replace",
+                                        Action::Restore { replace: true },
+                                    ));
+                                }
+                                Ok(Some(false)) => {
                                     notice = perform(
                                         app,
                                         &mut screen,
@@ -109,7 +118,7 @@ fn perform(
     entry: &Entry,
     action: Action<'_>,
 ) -> io::Result<String> {
-    let result = if matches!(action, Action::Restore { .. }) {
+    let result = if entry.ownership().is_some() || matches!(action, Action::Restore { .. }) {
         screen.with_terminal(|| app.perform(&entry.id, action))?
     } else {
         app.perform(&entry.id, action)

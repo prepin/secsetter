@@ -4,11 +4,11 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::paths::{Location, PathError};
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Format {
     Yaml,
@@ -29,7 +29,13 @@ impl Format {
         result.map_err(|reason| PathError::Blocked(destination.to_owned(), reason))
     }
 
-    pub fn write(self, destination: &Path, key: &[String], bytes: &[u8]) -> Result<(), String> {
+    pub fn write(
+        self,
+        location: &Location<'_>,
+        key: &[String],
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let destination = location.path();
         let value = str::from_utf8(bytes)
             .map_err(|_| format!("{destination:?}: secret input must be valid UTF-8"))?;
         let file_error = |error: PathError| match error {
@@ -39,7 +45,6 @@ impl Format {
             PathError::Blocked(..) => format!("Blocked: {error}"),
             _ => error.to_string(),
         };
-        let location = Location::destination(destination, false).map_err(file_error)?;
         let locked = location.lock().map_err(file_error)?;
         let mut file = location.open_regular().map_err(file_error)?;
         let document = read_document(&mut file, destination).map_err(file_error)?;

@@ -8,11 +8,11 @@ crossterm = "0.29"
 getrandom = "0.4"
 libc = "0.2"
 oneyaml = "1.2"
-rustix = { version = "1", features = ["fs", "process", "termios"] }
+rustix = { version = "1", features = ["fs", "net", "process", "termios"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 unicode-width = "0.2"
+tempfile = "3"
 
 [dev-dependencies]
 rustix = { version = "1", features = ["event", "pty"] }
-tempfile = "3"

@@ -29,6 +29,8 @@ pub(crate) struct Entry {
     platforms: Option<Vec<Platform>>,
     #[serde(default)]
     privileged: bool,
+    owner: Option<String>,
+    group: Option<String>,
     #[serde(flatten)]
     pub kind: Kind,
 }
@@ -65,6 +67,11 @@ enum Platform {
 }
 
 impl Entry {
+    pub fn ownership(&self) -> Option<(&str, &str)> {
+        self.privileged
+            .then(|| self.owner.as_deref().zip(self.group.as_deref()).unwrap())
+    }
+
     pub fn applies_here(&self) -> bool {
         let current = if cfg!(target_os = "linux") {
             Platform::Linux
@@ -132,9 +139,6 @@ impl Config {
                     source,
                     destination,
                 } => {
-                    if entry.privileged {
-                        return Err(invalid("privileged template installs are not supported"));
-                    }
                     if source.is_absolute()
                         || source.file_name().is_none()
                         || source.as_os_str().as_encoded_bytes().contains(&0)
@@ -145,18 +149,12 @@ impl Config {
                     destination
                 }
                 Kind::SecretFile { destination } | Kind::SecretField { destination, .. } => {
-                    if entry.privileged {
-                        return Err(invalid("privileged secret writes are not supported"));
-                    }
                     destination
                 }
                 Kind::FnoxFile {
                     source,
                     destination,
                 } => {
-                    if entry.privileged {
-                        return Err(invalid("privileged restores are not supported"));
-                    }
                     if source.is_empty() || source.contains('\0') {
                         return Err(invalid("fnox source must be non-empty and contain no NUL"));
                     }
@@ -175,6 +173,18 @@ impl Config {
                     continue;
                 }
             };
+            if entry.privileged {
+                for (name, value) in [("owner", &entry.owner), ("group", &entry.group)] {
+                    if value
+                        .as_ref()
+                        .is_none_or(|value| value.is_empty() || value.contains('\0'))
+                    {
+                        return Err(invalid(&format!(
+                            "privileged entries require a valid {name}"
+                        )));
+                    }
+                }
+            }
             *destination =
                 expand_destination(destination, &config_home).map_err(|reason| invalid(&reason))?;
         }
