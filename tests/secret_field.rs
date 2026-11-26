@@ -147,7 +147,9 @@ hosts.gitlab.example.com.token = 'unrelated'
 "#;
     fs::write(&path, original).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-    let old_metadata = fs::metadata(&path).unwrap();
+    // Keep the original inode alive across both replacements.
+    let original_file = File::open(&path).unwrap();
+    let old_metadata = original_file.metadata().unwrap();
 
     assert_eq!(fixture.list(), "token\tGitLab token\tNot set\n");
     assert_eq!(success(fixture.set(b"synthetic-token")), "Set\n");

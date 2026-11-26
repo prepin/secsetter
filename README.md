@@ -27,4 +27,4 @@ secsetter
 
 ## Release
 
-Update the version in `Cargo.toml` and refresh `Cargo.lock`. Merge those changes into `main` and check that CI passes. Push a tag that matches the Cargo version, such as `v1.0.0`. GitHub Actions builds and tests all three targets, then publishes the archives and checksums.
+Update the version in `Cargo.toml` and refresh `Cargo.lock`. Merge those changes into `master` and check that CI passes. Push a tag that matches the Cargo version, such as `v1.0.0`. GitHub Actions builds and tests all three targets, then publishes the archives and checksums.
