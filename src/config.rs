@@ -41,6 +41,9 @@ pub(crate) enum Kind {
     SecretFile {
         destination: PathBuf,
     },
+    Login {
+        command: Vec<String>,
+    },
 }
 
 #[derive(Deserialize, PartialEq)]
@@ -132,6 +135,18 @@ impl Config {
                         return Err(invalid("privileged secret writes are not supported"));
                     }
                     destination
+                }
+                Kind::Login { command } => {
+                    if entry.privileged {
+                        return Err(invalid("login entries cannot be privileged"));
+                    }
+                    if command.first().is_none_or(String::is_empty) {
+                        return Err(invalid("command must start with an executable"));
+                    }
+                    if command.iter().any(|argument| argument.contains('\0')) {
+                        return Err(invalid("command must not contain NUL characters"));
+                    }
+                    continue;
                 }
             };
             *destination =

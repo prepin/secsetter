@@ -16,6 +16,7 @@ pub(crate) enum Status {
     NotSet,
     Blocked(PathError),
     Unknown(PathError),
+    Untracked,
 }
 
 impl fmt::Display for Status {
@@ -27,6 +28,7 @@ impl fmt::Display for Status {
             Self::NotSet => f.write_str("Not set"),
             Self::Blocked(error) => write!(f, "Blocked: {error}"),
             Self::Unknown(error) => write!(f, "Unknown: {error}"),
+            Self::Untracked => Ok(()),
         }
     }
 }
@@ -53,6 +55,7 @@ impl App {
         let (destination, template) = match &entry.kind {
             Kind::Template { destination, .. } => (destination, true),
             Kind::SecretFile { destination } => (destination, false),
+            Kind::Login { .. } => return Status::Untracked,
         };
         match Location::destination(destination, false).and_then(|file| file.regular_file()) {
             Ok(_) if template => Status::Installed,
@@ -75,6 +78,13 @@ impl App {
             return Err(format!("entry {id:?} does not apply to this platform"));
         }
         Ok(entry)
+    }
+
+    pub fn login_command(&self, id: &str) -> Result<&[String], String> {
+        match &self.entry(id)?.kind {
+            Kind::Login { command } => Ok(command),
+            _ => Err(format!("login does not match entry {id:?}")),
+        }
     }
 
     pub fn perform(&self, id: &str, action: Action<'_>) -> Result<&'static str, String> {

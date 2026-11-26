@@ -271,6 +271,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "getrandom",
+ "libc",
  "rustix",
  "serde",
  "tempfile",

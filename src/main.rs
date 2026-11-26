@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod login;
 mod paths;
 mod tui;
 
@@ -7,7 +8,7 @@ use std::io::{self, IsTerminal};
 use std::process::ExitCode;
 use std::{env, ffi::OsStr};
 
-use app::{Action, App};
+use app::{Action, App, Status};
 
 fn main() -> ExitCode {
     match run() {
@@ -26,12 +27,12 @@ fn run() -> Result<(), String> {
         [command] if command == "list" => {
             let app = App::load()?;
             for entry in app.entries() {
-                println!(
-                    "{}\t{}\t{}",
-                    entry.id.escape_debug(),
-                    entry.label.escape_debug(),
-                    app.status(entry)
-                );
+                let id = entry.id.escape_debug();
+                let label = entry.label.escape_debug();
+                match app.status(entry) {
+                    Status::Untracked => println!("{id}\t{label}"),
+                    status => println!("{id}\t{label}\t{status}"),
+                }
             }
         }
         [command, id] if command == "install" => {
@@ -49,13 +50,21 @@ fn run() -> Result<(), String> {
                 App::load()?.perform(id, Action::Set(&mut stdin.lock()))?
             );
         }
-        [command, id] if command == "restore" || command == "login" => {
+        [command, id] if command == "login" => {
+            let id = id.to_str().ok_or("entry ID must be UTF-8")?;
+            let app = App::load()?;
+            return Err(format!(
+                "login {id:?}: {}",
+                login::exec(app.login_command(id)?)
+            ));
+        }
+        [command, id] if command == "restore" => {
             return reject_mismatch(command, id);
         }
         [command, id, flag] if command == "restore" && flag == "--replace" => {
             return reject_mismatch(command, id);
         }
-        _ => return Err("usage: secsetter [list | install <id> | set <id>]".into()),
+        _ => return Err("usage: secsetter [list | install <id> | set <id> | login <id>]".into()),
     }
     Ok(())
 }
