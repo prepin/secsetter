@@ -38,7 +38,7 @@ jobs:
           if [[ "$RUNNER_OS" == macOS ]]; then
             export RUST_TEST_THREADS=1
           fi
-          cargo +stable test --locked --target "$TARGET"
+          cargo +stable test --locked --target "$TARGET" -- --nocapture
         timeout-minutes: 4
       - run: cargo +stable build --release --locked --target "$TARGET"
       - name: Smoke-test and package the binary
