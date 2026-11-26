@@ -70,7 +70,7 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
                             Status::Installed => notice = "Already installed".into(),
                             status => notice = status.to_string(),
                         },
-                        Kind::SecretFile { .. } => {
+                        Kind::SecretFile { .. } | Kind::SecretField { .. } => {
                             notice = match prompt_secret(|prompt| {
                                 draw(app, &entries, login_start, selected, prompt)
                             })? {

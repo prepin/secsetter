@@ -55,6 +55,18 @@ impl App {
         let (destination, template) = match &entry.kind {
             Kind::Template { destination, .. } => (destination, true),
             Kind::SecretFile { destination } => (destination, false),
+            Kind::SecretField {
+                destination,
+                format,
+                key,
+            } => {
+                return match format.is_set(destination, key) {
+                    Ok(true) => Status::Set,
+                    Ok(false) | Err(PathError::Missing(_)) => Status::NotSet,
+                    Err(error @ PathError::Blocked(..)) => Status::Blocked(error),
+                    Err(error) => Status::Unknown(error),
+                };
+            }
             Kind::Login { .. } => return Status::Untracked,
         };
         match Location::destination(destination, false).and_then(|file| file.regular_file()) {
@@ -117,7 +129,7 @@ impl App {
                     Err(error) => Err(format!("install {id:?}: {error}")),
                 }
             }
-            (Action::Set(input), Kind::SecretFile { destination }) => {
+            (Action::Set(input), kind @ (Kind::SecretFile { .. } | Kind::SecretField { .. })) => {
                 let mut bytes = Vec::new();
                 input
                     .read_to_end(&mut bytes)
@@ -125,15 +137,27 @@ impl App {
                 if bytes.is_empty() {
                     return Err(format!("set {id:?}: secret input is empty"));
                 }
-                let write = || {
-                    Location::destination(destination, true)?
-                        .lock()?
-                        .write_file(&bytes[..])
-                };
-                write().map_err(|error| match error {
-                    PathError::Blocked(..) => format!("set {id:?}: Blocked: {error}"),
-                    _ => format!("set {id:?}: {error}"),
-                })?;
+                match kind {
+                    Kind::SecretFile { destination } => {
+                        let write = || {
+                            Location::destination(destination, true)?
+                                .lock()?
+                                .write_file(&bytes[..])
+                        };
+                        write().map_err(|error| match error {
+                            PathError::Blocked(..) => format!("set {id:?}: Blocked: {error}"),
+                            _ => format!("set {id:?}: {error}"),
+                        })?;
+                    }
+                    Kind::SecretField {
+                        destination,
+                        format,
+                        key,
+                    } => format
+                        .write(destination, key, &bytes)
+                        .map_err(|error| format!("set {id:?}: {error}"))?,
+                    _ => unreachable!("set requires a manual secret entry"),
+                }
                 Ok("Set")
             }
             (Action::Install, _) => Err(format!("install does not match entry {id:?}")),

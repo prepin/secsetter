@@ -8,6 +8,8 @@ use std::path::{Component, Path, PathBuf};
 use rustix::fs::{self, Mode, OFlags};
 use serde::Deserialize;
 
+use crate::secret_field::Format;
+
 pub(crate) struct Config {
     pub directory: OwnedFd,
     pub path: PathBuf,
@@ -40,6 +42,11 @@ pub(crate) enum Kind {
     },
     SecretFile {
         destination: PathBuf,
+    },
+    SecretField {
+        destination: PathBuf,
+        format: Format,
+        key: Vec<String>,
     },
     Login {
         command: Vec<String>,
@@ -113,6 +120,9 @@ impl Config {
             if !ids.insert(id) {
                 return Err(invalid("duplicate id"));
             }
+            if matches!(&entry.kind, Kind::SecretField { key, .. } if key.is_empty()) {
+                return Err(invalid("key must contain at least one name"));
+            }
             let destination = match &mut entry.kind {
                 Kind::Template {
                     source,
@@ -130,7 +140,7 @@ impl Config {
                     }
                     destination
                 }
-                Kind::SecretFile { destination } => {
+                Kind::SecretFile { destination } | Kind::SecretField { destination, .. } => {
                     if entry.privileged {
                         return Err(invalid("privileged secret writes are not supported"));
                     }

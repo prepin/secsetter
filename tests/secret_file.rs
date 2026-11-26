@@ -18,11 +18,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        fs::create_dir(root.join("secsetter")).unwrap();
-        fs::write(
-            root.join("secsetter/config.toml"),
+        Self::with_config(
             r#"
 [[entries]]
 id = "token"
@@ -31,7 +27,13 @@ kind = "secret-file"
 destination = "$XDG_CONFIG_HOME/secrets/token"
 "#,
         )
-        .unwrap();
+    }
+
+    fn with_config(config: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        fs::create_dir(root.join("secsetter")).unwrap();
+        fs::write(root.join("secsetter/config.toml"), config).unwrap();
         Self { _dir: dir, root }
     }
 
@@ -60,6 +62,23 @@ destination = "$XDG_CONFIG_HOME/secrets/token"
 
     fn list(&self) -> String {
         success(self.command().arg("list").output().unwrap())
+    }
+
+    fn tui(&self) -> Tui {
+        let (master, slave) = terminal();
+        let child = self
+            .command()
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave)
+            .spawn()
+            .unwrap();
+        Tui {
+            master,
+            child,
+            output: Vec::new(),
+            seen: 0,
+        }
     }
 }
 
@@ -168,20 +187,7 @@ fn cli_set_rejects_terminal_stdin() {
 fn tui_masks_a_paste_and_waits_for_explicit_submission() {
     let config = Fixture::new();
     let destination = config.destination();
-    let (master, slave) = terminal();
-    let child = config
-        .command()
-        .stdin(slave.try_clone().unwrap())
-        .stdout(slave.try_clone().unwrap())
-        .stderr(slave)
-        .spawn()
-        .unwrap();
-    let mut tui = Tui {
-        master,
-        child,
-        output: Vec::new(),
-        seen: 0,
-    };
+    let mut tui = config.tui();
 
     tui.read_through("Token file — Not set");
     tui.send(b"\r");
@@ -218,6 +224,61 @@ fn tui_masks_a_paste_and_waits_for_explicit_submission() {
     assert!(tui.child.wait().unwrap().success());
     let output = String::from_utf8_lossy(&tui.output);
     assert!(!output.contains("synthetic-paste"));
+    assert!(!output.contains("discard-me"));
+}
+
+#[test]
+fn tui_uses_the_masked_prompt_for_yaml_and_keeps_the_original_on_cancel() {
+    let config = Fixture::with_config(
+        r#"
+[[entries]]
+id = "token"
+label = "GitLab token"
+kind = "secret-field"
+destination = "$XDG_CONFIG_HOME/secrets/token"
+format = "yaml"
+key = ["token"]
+"#,
+    );
+    let path = config.destination();
+    let original = "token: 'old-synthetic-token' # keep\n";
+    fs::create_dir(path.parent().unwrap()).unwrap();
+    fs::write(&path, original).unwrap();
+    let mut tui = config.tui();
+
+    tui.read_through("GitLab token — Set");
+    tui.send(b"\r");
+    tui.read_through("Secret (Enter submit, Esc cancel): ");
+    tui.send(b"discard-me");
+    tui.read_through("Secret (Enter submit, Esc cancel): **********");
+    tui.send(b"\x1b");
+    tui.read_through("Set canceled");
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+    tui.send(b"\r");
+    tui.read_through("Secret (Enter submit, Esc cancel): ");
+    tui.send(b"\x1b[200~new-synthetic-token\n\x1b[201~");
+    tui.read_through("Secret (Enter submit, Esc cancel): ********************");
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    tui.send(b"\r");
+    tui.read_through("GitLab token — Set");
+    let edited = fs::read_to_string(path).unwrap();
+    assert!(edited.contains("# keep"));
+    assert_eq!(
+        oneyaml::Document::parse(edited)
+            .unwrap()
+            .get("token")
+            .unwrap()
+            .as_str()
+            .as_deref(),
+        Some("new-synthetic-token\n"),
+    );
+
+    tui.send(b"q");
+    tui.read_through("\x1b[?2004l");
+    assert!(tui.child.wait().unwrap().success());
+    let output = String::from_utf8_lossy(&tui.output);
+    assert!(!output.contains("synthetic-token"));
     assert!(!output.contains("discard-me"));
 }
 

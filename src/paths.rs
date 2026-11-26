@@ -206,6 +206,18 @@ impl LockedLocation<'_, '_> {
             Err(PathError::Missing(_)) => None,
             Err(error) => return Err(error),
         };
+        self.commit_file(input, existing)
+    }
+
+    pub fn replace_file(&self, original: &File, input: impl Read) -> Result<(), PathError> {
+        // A field edit may only replace the file it read.
+        let existing = fs::fstat(original)
+            .map_err(|error| PathError::io(&self.location.path, "inspect", error))?;
+        self.commit_file(input, Some(existing))
+    }
+
+    fn commit_file(&self, input: impl Read, existing: Option<fs::Stat>) -> Result<(), PathError> {
+        let location = self.location;
         let owner = existing.map(|stat| Uid::from_raw(stat.st_uid));
         let stage = location.stage_file(input, owner)?;
 
@@ -469,5 +481,23 @@ mod tests {
         assert!(path.is_symlink());
         assert_eq!(fs::read(target).unwrap(), b"unchanged");
         assert_eq!(fs::read_dir(parent).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn keeps_a_new_destination_if_a_field_edit_read_the_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("config");
+        fs::write(&path, b"original config").unwrap();
+        let location = Location::destination(&path, false).unwrap();
+        let locked = location.lock().unwrap();
+        let original = location.open_regular().unwrap();
+
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"other process's replacement").unwrap();
+        let result = locked.replace_file(&original, b"edited config".as_slice());
+
+        assert!(matches!(result, Err(PathError::Blocked(..))));
+        assert_eq!(fs::read(path).unwrap(), b"other process's replacement");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod login;
 mod paths;
+mod secret_field;
 mod tui;
 
 use std::io::{self, IsTerminal};
