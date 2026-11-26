@@ -3,7 +3,7 @@ use std::io::Read;
 use std::path::Path;
 
 use crate::config::{Config, Entry, Kind};
-use crate::file_write::{FileWrite, Outcome, write_error};
+use crate::file_write::{FileWrite, Outcome};
 use crate::fnox;
 use crate::paths::{self, Location, PathError};
 use crate::privileged;
@@ -180,14 +180,22 @@ impl App {
     }
 }
 
-pub(crate) fn restore_destination_exists(
+pub(crate) enum RestoreDestination {
+    Present,
+    Missing,
+    RequiresElevation,
+}
+
+pub(crate) fn restore_destination(
     entry: &Entry,
     destination: &Path,
-) -> Result<Option<bool>, PathError> {
+) -> Result<RestoreDestination, PathError> {
     match Location::destination(destination, false).and_then(|location| location.regular_file()) {
-        Ok(_) => Ok(Some(true)),
-        Err(PathError::Missing(_)) => Ok(Some(false)),
-        Err(PathError::Io(..)) if entry.ownership().is_some() => Ok(None),
+        Ok(_) => Ok(RestoreDestination::Present),
+        Err(PathError::Missing(_)) => Ok(RestoreDestination::Missing),
+        Err(PathError::Io(..)) if entry.ownership().is_some() => {
+            Ok(RestoreDestination::RequiresElevation)
+        }
         Err(error) => Err(error),
     }
 }
@@ -205,9 +213,9 @@ fn restore_file(
             "restore {id:?}: destination already exists; confirm replacement or use --replace: {destination:?}"
         )
     };
-    let exists = restore_destination_exists(entry, destination)
-        .map_err(|error| restore_error(write_error(error)))?;
-    if exists == Some(true) && !replace {
+    let state = restore_destination(entry, destination)
+        .map_err(|error| restore_error(error.for_write()))?;
+    if matches!(state, RestoreDestination::Present) && !replace {
         return Err(needs_approval());
     }
     let bytes = fnox::fetch(source).map_err(restore_error)?;

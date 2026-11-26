@@ -11,7 +11,6 @@ use std::time::Duration;
 use rustix::process::{self, Gid, Uid};
 
 use crate::file_write::{FileWrite, Outcome};
-use crate::paths;
 
 pub(crate) const HELPER: &str = "__write";
 const COMPLETE: u8 = 1;
@@ -56,12 +55,10 @@ pub(crate) fn write(
         .map_err(channel_error)?;
     let mut socket = loop {
         match listener.accept() {
-            Ok((socket, _)) => break socket,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Ok((socket, _)) if peer_uid(&socket).is_ok_and(|uid| uid.is_root()) => break socket,
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if let Some(status) = child.try_wait().map_err(channel_error)? {
-                    return Err(helper_failure(destination, status));
-                }
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(error) => {
@@ -70,12 +67,12 @@ pub(crate) fn write(
                 return Err(channel_error(error));
             }
         }
+        if let Some(status) = child.try_wait().map_err(channel_error)? {
+            return Err(helper_failure(destination, status));
+        }
     };
-    let reply = match peer_uid(&socket) {
-        Ok(uid) if uid.is_root() => exchange(&mut socket, bytes),
-        Ok(_) => Err(io::Error::other("privileged helper is not running as root")),
-        Err(error) => Err(error),
-    };
+    drop(listener);
+    let reply = exchange(&mut socket, bytes);
     drop(socket);
     let status = child.wait().map_err(channel_error)?;
     if !status.success() {
@@ -140,8 +137,6 @@ pub(crate) fn run_helper(args: &[OsString]) -> Result<(), String> {
             return Err("secret input is empty".into());
         }
         let ownership = lookup_ownership(owner, group)?;
-        paths::handle_write_interrupts()
-            .map_err(|error| format!("set up interruption: {error}"))?;
         operation.apply(path, Some(ownership), &bytes)
     })();
     let reply = match result {

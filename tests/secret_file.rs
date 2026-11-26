@@ -157,6 +157,68 @@ fn sets_and_replaces_a_whole_file_without_changing_the_input_bytes() {
     assert_ne!(new_metadata.ino(), old_metadata.ino());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_signals_abort_a_write_waiting_for_the_directory_lock() {
+    use rustix::fs::{FlockOperation, flock};
+
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        let config = Fixture::new();
+        let destination = config.destination();
+        let parent = destination.parent().unwrap();
+        fs::create_dir(parent).unwrap();
+        fs::write(&destination, b"original").unwrap();
+        let directory = File::open(parent).unwrap();
+        flock(&directory, FlockOperation::LockExclusive).unwrap();
+
+        let mut child = config
+            .command()
+            .args(["set", "token"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"replacement")
+            .unwrap();
+
+        // Wait until the child enters the transaction, with the directory still locked.
+        let fds = format!("/proc/{}/fd", child.id());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fs::read_dir(&fds)
+            .unwrap()
+            .flatten()
+            .any(|fd| fs::read_link(fd.path()).is_ok_and(|path| path == parent))
+        {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("set did not enter the write transaction");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // SAFETY: This PID is the live child which waits for the lock.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("set did not cancel while waiting for the lock");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert_failure(child.wait_with_output().unwrap(), "write interrupted");
+        assert_eq!(fs::read(&destination).unwrap(), b"original");
+        assert_eq!(fs::read_dir(parent).unwrap().count(), 1);
+    }
+}
+
 #[test]
 fn restores_the_literal_fnox_path_key_as_an_exact_private_file() {
     let config = Fixture::with_config(FNOX_CONFIG);

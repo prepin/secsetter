@@ -5,6 +5,7 @@ use std::io::{self, Read};
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use rustix::fs::{self, AtFlags, CWD, FileType, FlockOperation, Mode, OFlags, RenameFlags};
 use rustix::io::Errno;
@@ -13,24 +14,48 @@ use rustix::process::{Gid, Uid};
 const PRIVATE_DIR: Mode = Mode::RWXU;
 const PRIVATE_FILE: Mode = Mode::RUSR.union(Mode::WUSR);
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+const WRITE_SIGNALS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGTERM];
 
-pub(crate) fn handle_write_interrupts() -> io::Result<()> {
-    extern "C" fn interrupt(_: libc::c_int) {
-        INTERRUPTED.store(true, Ordering::Relaxed);
-    }
+pub(crate) struct WriteInterrupts {
+    previous: [Option<libc::sigaction>; WRITE_SIGNALS.len()],
+}
 
-    // SAFETY: The structures are initialized and the handler only stores an atomic flag.
-    unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = interrupt as *const () as libc::sighandler_t;
-        libc::sigemptyset(&mut action.sa_mask);
-        for signal in [libc::SIGINT, libc::SIGTERM] {
-            if libc::sigaction(signal, &action, std::ptr::null_mut()) == -1 {
-                return Err(io::Error::last_os_error());
+impl WriteInterrupts {
+    pub fn start() -> io::Result<Self> {
+        extern "C" fn interrupt(_: libc::c_int) {
+            INTERRUPTED.store(true, Ordering::Relaxed);
+        }
+
+        let mut scope = Self {
+            previous: [None; WRITE_SIGNALS.len()],
+        };
+        // SAFETY: The structures are initialized and the handler only stores an atomic flag.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = interrupt as *const () as libc::sighandler_t;
+            libc::sigemptyset(&mut action.sa_mask);
+            for (signal, saved) in WRITE_SIGNALS.into_iter().zip(&mut scope.previous) {
+                let mut previous = std::mem::zeroed();
+                if libc::sigaction(signal, &action, &mut previous) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                *saved = Some(previous);
             }
         }
+        Ok(scope)
     }
-    Ok(())
+}
+
+impl Drop for WriteInterrupts {
+    fn drop(&mut self) {
+        for (signal, previous) in WRITE_SIGNALS.into_iter().zip(&self.previous) {
+            if let Some(previous) = previous {
+                // SAFETY: This action came from a successful sigaction call for this signal.
+                unsafe { libc::sigaction(signal, previous, std::ptr::null_mut()) };
+            }
+        }
+        INTERRUPTED.store(false, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug)]
@@ -41,6 +66,20 @@ pub(crate) enum PathError {
 }
 
 impl PathError {
+    pub fn for_write(self) -> String {
+        match self {
+            Self::Blocked(..) => format!("Blocked: {self}"),
+            _ => self.to_string(),
+        }
+    }
+
+    pub fn for_field_write(self, destination: &Path) -> String {
+        match self {
+            Self::Missing(_) => format!("{destination:?} requires an existing file: {self}"),
+            _ => self.for_write(),
+        }
+    }
+
     fn lookup(path: &Path, cause: Errno) -> Self {
         match cause {
             Errno::NOENT => Self::Missing(path.to_owned()),
@@ -137,6 +176,23 @@ impl<'a> Location<'a> {
         &self.path
     }
 
+    fn revalidate_parent(&self) -> Result<(), PathError> {
+        let parent_path = self.path.parent().expect("destination has a parent");
+        let changed = || PathError::Blocked(parent_path.to_owned(), "parent changed during write");
+        let current = Location::destination(&self.path, false).map_err(|error| match error {
+            PathError::Missing(_) => changed(),
+            _ => error,
+        })?;
+        let stat = |parent: &OwnedFd| {
+            fs::fstat(parent).map_err(|error| PathError::io(parent_path, "inspect", error))
+        };
+        let (pinned, current) = (stat(&self.parent)?, stat(&current.parent)?);
+        if (pinned.st_dev, pinned.st_ino) != (current.st_dev, current.st_ino) {
+            return Err(changed());
+        }
+        Ok(())
+    }
+
     fn check_interrupted(&self) -> Result<(), PathError> {
         if INTERRUPTED.load(Ordering::Relaxed) {
             Err(PathError::io(
@@ -193,9 +249,11 @@ impl<'a> Location<'a> {
         .map_err(lock_error)?;
         loop {
             self.check_interrupted()?;
-            match fs::flock(&guard, FlockOperation::LockExclusive) {
+            match fs::flock(&guard, FlockOperation::NonBlockingLockExclusive) {
                 Ok(()) => break,
                 Err(Errno::INTR) => continue,
+                // A blocking lock could miss a signal delivered just before the syscall.
+                Err(Errno::WOULDBLOCK) => std::thread::sleep(Duration::from_millis(20)),
                 Err(error) => return Err(lock_error(error)),
             }
         }
@@ -212,6 +270,7 @@ impl<'a> Location<'a> {
             Err(error) => return Err(error),
         }
         let stage = self.stage_file(input, None)?;
+        self.revalidate_parent()?;
         self.check_interrupted()?;
         match stage.commit_new(self) {
             Ok(()) => Ok(true),
@@ -280,6 +339,7 @@ impl LockedLocation<'_, '_> {
         let location = self.location;
         let owner = existing.map(|stat| Uid::from_raw(stat.st_uid));
         let stage = location.stage_file(input, owner)?;
+        location.revalidate_parent()?;
 
         let commit = if let Some(existing) = existing {
             let current = location.regular_file()?;
@@ -292,6 +352,8 @@ impl LockedLocation<'_, '_> {
                 ));
             }
             location.check_interrupted()?;
+            // shortcut: rename cannot compare the destination inode, so keep the final
+            // no-follow check adjacent to the atomic rename until a conditional primitive exists.
             fs::renameat(&stage.fd, "file", &location.parent, location.name)
         } else {
             location.check_interrupted()?;
@@ -473,14 +535,14 @@ mod tests {
             symlink(&target, &path).unwrap();
         })));
 
-        assert!(matches!(result, Err(PathError::Blocked(..))));
-        assert!(path.is_symlink());
+        assert!(matches!(result, Err(PathError::Blocked(component, _)) if component == path));
+        assert_eq!(fs::read_link(&path).unwrap(), target);
         assert!(!target.exists());
         assert_eq!(fs::read_dir(parent).unwrap().count(), 1);
     }
 
     #[test]
-    fn does_not_follow_a_parent_link_substituted_during_copy() {
+    fn refuses_creation_if_the_parent_becomes_a_symlink_during_copy() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let parent = root.join("parent");
@@ -491,13 +553,37 @@ mod tests {
         let path = parent.join("config");
         let location = Location::destination(&path, false).unwrap();
 
-        let _ = location.create_file(WhileCopying(Some(|| {
+        let result = location.create_file(WhileCopying(Some(|| {
             fs::rename(&parent, &moved).unwrap();
             symlink(&outside, &parent).unwrap();
         })));
 
+        assert!(matches!(result, Err(PathError::Blocked(component, _)) if component == parent));
         assert!(parent.is_symlink());
-        assert!(!outside.join("config").exists());
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(moved).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn refuses_replacement_if_the_parent_directory_changes_during_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let parent = root.join("parent");
+        let moved = root.join("moved");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("config");
+        fs::write(&path, b"original").unwrap();
+        let location = Location::destination(&path, false).unwrap();
+
+        let result = location.lock().unwrap().write_file(WhileCopying(Some(|| {
+            fs::rename(&parent, &moved).unwrap();
+            fs::create_dir(&parent).unwrap();
+        })));
+
+        assert!(matches!(result, Err(PathError::Blocked(component, _)) if component == parent));
+        assert_eq!(fs::read_dir(parent).unwrap().count(), 0);
+        assert_eq!(fs::read(moved.join("config")).unwrap(), b"original");
+        assert_eq!(fs::read_dir(moved).unwrap().count(), 1);
     }
 
     #[test]
@@ -539,8 +625,8 @@ mod tests {
             fs::remove_file(&path).unwrap();
             symlink(&target, &path).unwrap();
         })));
-        assert!(matches!(result, Err(PathError::Blocked(..))));
-        assert!(path.is_symlink());
+        assert!(matches!(result, Err(PathError::Blocked(component, _)) if component == path));
+        assert_eq!(fs::read_link(&path).unwrap(), target);
         assert_eq!(fs::read(target).unwrap(), b"unchanged");
         assert_eq!(fs::read_dir(parent).unwrap().count(), 2);
     }

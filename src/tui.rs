@@ -10,7 +10,7 @@ use crossterm::style::Print;
 use crossterm::terminal::{self, Clear, ClearType};
 use unicode_width::UnicodeWidthChar;
 
-use crate::app::{Action, App, Status, restore_destination_exists};
+use crate::app::{Action, App, RestoreDestination, Status, restore_destination};
 use crate::config::{Entry, Kind};
 use crate::login;
 use screen::Screen;
@@ -82,17 +82,17 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
                             };
                         }
                         Kind::FnoxFile { destination, .. } => {
-                            match restore_destination_exists(entry, destination) {
-                                Ok(Some(true)) => {
+                            match restore_destination(entry, destination) {
+                                Ok(RestoreDestination::Present) => {
                                     confirm = Some(("Replace", Action::Restore { replace: true }));
                                 }
-                                Ok(None) => {
+                                Ok(RestoreDestination::RequiresElevation) => {
                                     confirm = Some((
                                         "Restore or replace",
                                         Action::Restore { replace: true },
                                     ));
                                 }
-                                Ok(Some(false)) => {
+                                Ok(RestoreDestination::Missing) => {
                                     notice = perform(
                                         app,
                                         &mut screen,

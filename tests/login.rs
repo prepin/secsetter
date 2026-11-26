@@ -214,6 +214,111 @@ fn cli_runs_in_the_current_terminal_and_preserves_interrupt_status() {
     assert_eq!(pty.wait().signal(), Some(libc::SIGINT));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "run inside an isolated Linux user namespace with UID and GID 1 mapped"]
+fn fake_sudo_uses_the_controlling_terminal_and_secsetter_recovers_from_refusal_or_ctrl_c() {
+    let config = ConfigDir::new(
+        r#"
+[[entries]]
+id = "token"
+label = "Synthetic privileged token"
+kind = "secret-file"
+destination = "$XDG_CONFIG_HOME/token"
+privileged = true
+owner = "root"
+group = "root"
+"#,
+    );
+    let base = config.0.path();
+    fs::set_permissions(base, fs::Permissions::from_mode(0o755)).unwrap();
+    let fake_sudo = base.join("fake-sudo");
+    fs::write(
+        &fake_sudo,
+        r#"#!/bin/sh
+noninteractive=false
+if [ "$1" = -n ]; then
+    noninteractive=true
+    shift
+fi
+[ "$#" = 10 ] && [ "$1" = -u ] && [ "$2" = root ] && [ "$3" = -- ] &&
+    [ "$5" = __write ] && [ -z "$(cat)" ] || exit 90
+if "$noninteractive"; then
+    printf 'Synthetic noninteractive refusal\n' >&2
+    exit 41
+fi
+printf 'Synthetic sudo prompt: ' >/dev/tty
+IFS= read -r answer </dev/tty || exit 91
+[ "$answer" = 'no' ] || exit 92
+exit 42
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fake_sudo, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let isolated = || {
+        let mut command = Command::new("/usr/bin/unshare");
+        command
+            .args(["--mount", "--propagation", "private", "/bin/sh", "-c"])
+            .arg(
+                r#"
+                /usr/bin/mount --bind "$1" /usr/bin/sudo || exit 93
+                shift
+                exec /usr/bin/setpriv --reuid=1 --regid=1 --clear-groups "$@"
+                "#,
+            )
+            .arg("isolated-sudo")
+            .arg(&fake_sudo)
+            .arg(env!("CARGO_BIN_EXE_secsetter"))
+            .env("XDG_CONFIG_HOME", base);
+        command
+    };
+    let mut pty = Terminal::launch(isolated());
+    pty.expect("Synthetic privileged token — Not set");
+    for (answer, failure) in [
+        (b"no\n".as_slice(), "exit status: 42"),
+        (b"\x03".as_slice(), "signal: 2"),
+    ] {
+        pty.send(b"\r");
+        pty.expect("Secret (Enter submit, Esc cancel): ");
+        pty.send(b"synthetic payload\r");
+        let suspended = pty.expect("Synthetic sudo prompt: ");
+        assert!(suspended.contains("\x1b[?2004l") && suspended.contains("\x1b[?1049l"));
+        pty.send(answer);
+        pty.expect("\x1b[?1049h");
+        assert!(pty.expect(failure).contains("Not set"));
+        assert!(!base.join("token").exists());
+    }
+    pty.quit();
+
+    let mut command = isolated();
+    use std::process::Stdio;
+    command
+        .args(["set", "token"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: Only the async-signal-safe setsid syscall runs before exec.
+    unsafe { command.pre_exec(|| rustix::process::setsid().map(|_| ()).map_err(Into::into)) };
+    let mut child = command.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"synthetic payload\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Synthetic noninteractive refusal"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("exit status: 41"), "{stderr}");
+    assert!(!stderr.contains("synthetic payload"));
+    assert!(!base.join("token").exists());
+}
+
 struct Terminal {
     child: Child,
     master: File,

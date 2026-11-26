@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use rustix::fs::{self, Mode, OFlags};
 use serde::Deserialize;
 
-use crate::secret_field::Format;
+use crate::secret_field::{Format, validate_key};
 
 pub(crate) struct Config {
     pub directory: OwnedFd,
@@ -131,8 +131,8 @@ impl Config {
             if !ids.insert(id) {
                 return Err(invalid("duplicate id"));
             }
-            if matches!(&entry.kind, Kind::SecretField { key, .. } if key.is_empty()) {
-                return Err(invalid("key must contain at least one name"));
+            if let Kind::SecretField { key, .. } = &entry.kind {
+                validate_key(key).map_err(invalid)?;
             }
             let destination = match &mut entry.kind {
                 Kind::Template {

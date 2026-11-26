@@ -18,6 +18,13 @@ pub(crate) enum Format {
     Yaml,
 }
 
+pub(crate) fn validate_key(key: &[String]) -> Result<(), &'static str> {
+    if key.is_empty() {
+        return Err("key must contain at least one name");
+    }
+    Ok(())
+}
+
 enum EditError {
     Blocked(&'static str),
     MissingParent(usize),
@@ -44,13 +51,7 @@ impl Format {
         let destination = location.path();
         let value = str::from_utf8(bytes)
             .map_err(|_| format!("{destination:?}: secret input must be valid UTF-8"))?;
-        let file_error = |error: PathError| match error {
-            PathError::Missing(_) => {
-                format!("{destination:?} requires an existing file: {error}")
-            }
-            PathError::Blocked(..) => format!("Blocked: {error}"),
-            _ => error.to_string(),
-        };
+        let file_error = |error: PathError| error.for_field_write(destination);
         let locked = location.lock().map_err(file_error)?;
         let mut file = location.open_regular().map_err(file_error)?;
         let document = read_document(&mut file, destination).map_err(file_error)?;
@@ -60,7 +61,9 @@ impl Format {
             Self::Yaml => yaml::edit(document, key, value),
         }
         .map_err(|error| match error {
-            EditError::Blocked(reason) => format!("Blocked: {destination:?}: {reason}"),
+            EditError::Blocked(reason) => {
+                PathError::Blocked(destination.to_owned(), reason).for_write()
+            }
             EditError::MissingParent(0) => {
                 format!("{destination:?}: the root object does not exist")
             }
