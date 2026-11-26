@@ -12,6 +12,7 @@ pub(crate) enum FileWrite {
     Create,
     Replace,
     Field { format: Format, key: Vec<String> },
+    Remove,
 }
 
 #[derive(PartialEq, Eq)]
@@ -28,6 +29,12 @@ impl FileWrite {
         bytes: &[u8],
     ) -> Result<Outcome, String> {
         let field = matches!(self, Self::Field { .. });
+        let clearing = bytes.is_empty() && (field || matches!(self, Self::Remove));
+        match self {
+            Self::Replace if bytes.is_empty() => return Err("secret input is empty".into()),
+            Self::Remove if !bytes.is_empty() => return Err("unexpected input for removal".into()),
+            _ => {}
+        }
         if let Self::Field { key, .. } = self {
             validate_key(key).map_err(|error| format!("{path:?}: {error}"))?;
         }
@@ -35,15 +42,14 @@ impl FileWrite {
             WriteInterrupts::start().map_err(|error| format!("set up interruption: {error}"))?;
         let location = match ownership {
             Some(ownership) => Location::privileged(path, ownership),
-            None => Location::destination(path, !field),
-        }
-        .map_err(|error| {
-            if field {
-                error.for_field_write(path)
-            } else {
-                error.for_write()
-            }
-        })?;
+            None => Location::destination(path, matches!(self, Self::Create | Self::Replace)),
+        };
+        let location = match location {
+            Ok(location) => location,
+            Err(PathError::Missing(_)) if clearing => return Ok(Outcome::Written),
+            Err(error) if field => return Err(error.for_field_write(path)),
+            Err(error) => return Err(error.for_write()),
+        };
         match self {
             Self::Create => {
                 if !location.create_file(bytes).map_err(PathError::for_write)? {
@@ -55,6 +61,10 @@ impl FileWrite {
                 .and_then(|locked| locked.write_file(bytes))
                 .map_err(PathError::for_write)?,
             Self::Field { format, key } => format.write(&location, key, bytes)?,
+            Self::Remove => location
+                .lock()
+                .and_then(|locked| locked.remove_file())
+                .map_err(PathError::for_write)?,
         }
         Ok(Outcome::Written)
     }

@@ -12,6 +12,7 @@ pub(crate) enum Action<'a> {
     Install,
     Set(&'a mut dyn Read),
     Restore { replace: bool },
+    Clear,
 }
 
 pub(crate) enum Status {
@@ -172,6 +173,28 @@ impl App {
                 write(entry, destination, operation, &bytes)
                     .map_err(|error| format!("set {id:?}: {error}"))?;
                 Ok("Set")
+            }
+            (Action::Clear, kind) => {
+                let (destination, operation) = match kind {
+                    Kind::SecretFile { destination } | Kind::FnoxFile { destination, .. } => {
+                        (destination, FileWrite::Remove)
+                    }
+                    Kind::SecretField {
+                        destination,
+                        format,
+                        key,
+                    } => (
+                        destination,
+                        FileWrite::Field {
+                            format: *format,
+                            key: key.clone(),
+                        },
+                    ),
+                    _ => return Err(format!("clear does not match entry {id:?}")),
+                };
+                write(entry, destination, operation, &[])
+                    .map_err(|error| format!("clear {id:?}: {error}"))?;
+                Ok("Cleared")
             }
             (Action::Install, _) => Err(format!("install does not match entry {id:?}")),
             (Action::Set(_), _) => Err(format!("set does not match entry {id:?}")),

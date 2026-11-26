@@ -34,12 +34,16 @@ impl Format {
     pub fn is_set(self, destination: &Path, key: &[String]) -> Result<bool, PathError> {
         let mut file = Location::destination(destination, false)?.open_regular()?;
         let document = read_document(&mut file, destination)?;
-        let result = match self {
+        self.document_is_set(document, key)
+            .map_err(|reason| PathError::Blocked(destination.to_owned(), reason))
+    }
+
+    fn document_is_set(self, document: String, key: &[String]) -> Result<bool, &'static str> {
+        match self {
             Self::Json => json::is_set(document, key),
             Self::Toml => toml::is_set(document, key),
             Self::Yaml => yaml::is_set(document, key),
-        };
-        result.map_err(|reason| PathError::Blocked(destination.to_owned(), reason))
+        }
     }
 
     pub fn write(
@@ -53,8 +57,19 @@ impl Format {
             .map_err(|_| format!("{destination:?}: secret input must be valid UTF-8"))?;
         let file_error = |error: PathError| error.for_field_write(destination);
         let locked = location.lock().map_err(file_error)?;
-        let mut file = location.open_regular().map_err(file_error)?;
+        let mut file = match location.open_regular() {
+            Ok(file) => file,
+            Err(PathError::Missing(_)) if value.is_empty() => return Ok(()),
+            Err(error) => return Err(file_error(error)),
+        };
         let document = read_document(&mut file, destination).map_err(file_error)?;
+        if value.is_empty()
+            && !self
+                .document_is_set(document.clone(), key)
+                .map_err(|reason| file_error(PathError::Blocked(destination.to_owned(), reason)))?
+        {
+            return Ok(());
+        }
         let edited = match self {
             Self::Json => json::edit(document, key, value),
             Self::Toml => toml::edit(document, key, value),

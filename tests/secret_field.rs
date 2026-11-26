@@ -95,6 +95,46 @@ fn failure(output: Output, reason: &str) -> String {
 }
 
 #[test]
+fn clear_empties_only_the_selected_field_and_does_not_create_missing_prerequisites() {
+    for (format, original, missing) in [
+        (
+            "yaml",
+            "hosts:\n  gitlab.example.com:\n    token: \"secret-value\" # keep\n    retries: 3\n",
+            "hosts:\n  gitlab.example.com:\n    retries: 3 # keep\n",
+        ),
+        (
+            "toml",
+            "[hosts.\"gitlab.example.com\"]\ntoken = \"secret-value\" # keep\nretries = 3\n",
+            "[hosts.\"gitlab.example.com\"]\nretries = 3 # keep\n",
+        ),
+        (
+            "json",
+            r#"{"hosts":{"gitlab.example.com":{"token":"secret-value","retries":3}}}"#,
+            r#"{"hosts":{"gitlab.example.com":{"retries":3}}}"#,
+        ),
+    ] {
+        let fixture = Fixture::with_format(format, format);
+        let path = fixture.destination();
+        let clear = || fixture.command().args(["clear", "token"]).output().unwrap();
+        assert_eq!(success(clear()), "Cleared\n");
+        assert!(!path.parent().unwrap().exists());
+        fs::create_dir(path.parent().unwrap()).unwrap();
+        fs::write(&path, original).unwrap();
+        assert_eq!(success(clear()), "Cleared\n");
+        assert_eq!(fixture.list(), "token\tGitLab token\tNot set\n");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original.replace("secret-value", "")
+        );
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+
+        fs::write(&path, missing).unwrap();
+        assert_eq!(success(clear()), "Cleared\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), missing);
+    }
+}
+
+#[test]
 fn replaces_a_literal_toml_field_and_keeps_comments_and_other_values() {
     let fixture = Fixture::with_format("toml", "toml");
     let path = fixture.destination();

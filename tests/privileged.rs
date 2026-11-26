@@ -227,7 +227,17 @@ fn public_commands_write_declared_destinations_through_the_root_helper() {
     failure(run(&["set", "token"], Some(b"refused")), "symbolic link");
     assert!(private.is_symlink());
     assert_root_file(&moved.join("token"), b"replacement\0\r\n");
-    assert_eq!(fs::read_dir(moved).unwrap().count(), 3);
+    assert_eq!(fs::read_dir(&moved).unwrap().count(), 3);
+
+    failure(run(&["clear", "token"], None), "symbolic link");
+    fs::remove_file(&private).unwrap();
+    fs::rename(&moved, &private).unwrap();
+    fs::remove_file(&fetched).unwrap();
+    success(run(&["clear", "profile"], None));
+    success(run(&["clear", "token"], None));
+    success(run(&["clear", "field"], None));
+    assert!(!profile.exists() && !token.exists() && !fetched.exists());
+    assert_root_file(&installed, b"token = \"\"\n# keep\n");
 }
 
 fn assert_root_file(path: &Path, bytes: &[u8]) {

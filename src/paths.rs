@@ -318,6 +318,23 @@ pub(crate) struct LockedLocation<'location, 'path> {
 }
 
 impl LockedLocation<'_, '_> {
+    pub fn remove_file(&self) -> Result<(), PathError> {
+        let location = self.location;
+        location.revalidate_parent()?;
+        match location.regular_file() {
+            Ok(_) => {}
+            Err(PathError::Missing(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        location.check_interrupted()?;
+        // shortcut: unlink cannot compare the destination inode, so check the leaf
+        // immediately before unlinking until a conditional primitive exists.
+        match fs::unlinkat(&location.parent, location.name, AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(error) => Err(PathError::io(&location.path, "remove", error)),
+        }
+    }
+
     pub fn write_file(&self, input: impl Read) -> Result<(), PathError> {
         let location = self.location;
         let existing = match location.regular_file() {

@@ -52,14 +52,15 @@ impl View<'_> {
         let wide = area.width >= 90 && area.height >= 22;
         let entry = self.entries.get(self.selected).copied();
         let confirmation_destination = entry.and_then(|entry| match &entry.kind {
-            Kind::Template { destination, .. } | Kind::FnoxFile { destination, .. } => {
-                Some(destination.as_path())
-            }
-            _ => None,
+            Kind::Template { destination, .. }
+            | Kind::FnoxFile { destination, .. }
+            | Kind::SecretFile { destination }
+            | Kind::SecretField { destination, .. } => Some(destination.as_path()),
+            Kind::Login { .. } => None,
         });
         let popup = (!matches!(panel, Panel::Notice(_))).then(|| {
             let scaled_width = (u32::from(area.width) * 62 / 100) as u16;
-            let (width, height) = if matches!(panel, Panel::Confirm { .. }) {
+            let (width, height) = if let Panel::Confirm { verb, .. } = panel {
                 let width = scaled_width.clamp(48, 72).min(area.width - 2);
                 let height = if width >= 48 && area.height >= 16 {
                     let wraps = confirmation_destination.is_some_and(|path| {
@@ -67,7 +68,7 @@ impl View<'_> {
                     });
                     9 + u16::from(wraps)
                 } else {
-                    5 + u16::from(area.height >= 10)
+                    5 + u16::from(area.height >= 10 || verb == "Clear")
                 };
                 (width, height)
             } else {
@@ -126,7 +127,8 @@ impl View<'_> {
         }
 
         if let Panel::Notice(notice) = panel {
-            render_notice(frame, footer, notice, compact_reason, wide);
+            let can_clear = matches!(status, Some(Status::Set));
+            render_notice(frame, footer, notice, compact_reason, wide, can_clear);
         } else if let (Some(popup), Some(entry), Some(status)) = (popup, entry, status) {
             for cell in &mut frame.buffer_mut().content {
                 if cell.symbol() != " " && cell.bg != ACCENT {
@@ -141,7 +143,7 @@ impl View<'_> {
                     render_confirmation(
                         frame,
                         popup,
-                        &entry.label,
+                        entry,
                         confirmation_destination,
                         verb,
                         cancel_selected,
@@ -329,6 +331,7 @@ fn render_notice(
     notice: &str,
     reason: Option<Cow<'_, str>>,
     wide: bool,
+    can_clear: bool,
 ) {
     let block = if wide {
         Block::bordered()
@@ -346,16 +349,18 @@ fn render_notice(
     };
     frame.render_widget(block.border_style(Style::new().fg(Color::DarkGray)), area);
     frame.render_widget(Paragraph::new(Line::from(text)).wrap(WRAP), message);
-    frame.render_widget(
-        Line::from("↑/↓ move  Enter open  Esc quit".fg(ACCENT)),
-        controls,
-    );
+    let keys = match (can_clear, controls.width >= 46) {
+        (true, true) => "↑/↓ move  Enter open  Del clear  Esc quit",
+        (true, false) => "↑/↓  Enter  Del clear  Esc",
+        (false, _) => "↑/↓ move  Enter open  Esc quit",
+    };
+    frame.render_widget(Line::from(keys.fg(ACCENT)), controls);
 }
 
 fn render_confirmation(
     frame: &mut Frame,
     area: Rect,
-    entry_label: &str,
+    entry: &Entry,
     destination: Option<&Path>,
     verb: &str,
     cancel_selected: bool,
@@ -363,6 +368,8 @@ fn render_confirmation(
     let title = match verb {
         "Install" => " Install config? ",
         "Replace" => " Replace from fnox? ",
+        "Clear" if matches!(entry.kind, Kind::SecretField { .. }) => " Empty this field? ",
+        "Clear" => " Remove this file? ",
         _ => " Restore or replace? ",
     };
     let inner = draw_popup(frame, area, title);
@@ -370,7 +377,7 @@ fn render_confirmation(
     let [details, _, buttons, _, controls] =
         Layout::vertical([Fill(1), Length(gap), Length(1), Length(gap), Length(1)]).areas(inner);
     let width = usize::from(inner.width);
-    let mut description = vec![fit(entry_label, width).bold().into()];
+    let mut description = vec![fit(&entry.label, width).bold().into()];
     if details.height > 1
         && let Some(destination) = destination
     {

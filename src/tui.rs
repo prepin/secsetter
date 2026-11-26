@@ -22,8 +22,8 @@ impl Confirmation {
     fn new(verb: &'static str, action: Action<'static>) -> Self {
         Self {
             verb,
+            cancel_selected: matches!(action, Action::Clear),
             action,
-            cancel_selected: false,
         }
     }
 }
@@ -96,6 +96,18 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+            KeyCode::Delete => {
+                if let Some(entry) = entries.get(selected) {
+                    match app.status(entry) {
+                        Status::Set => confirm = Some(Confirmation::new("Clear", Action::Clear)),
+                        Status::NotSet => notice = "Nothing to clear: secret is not set".into(),
+                        status @ (Status::Blocked(_) | Status::Unknown(_)) => {
+                            notice = status.to_string();
+                        }
+                        _ => notice = "Only secrets can be cleared".into(),
+                    }
+                }
+            }
             KeyCode::Up | KeyCode::Down => {
                 let next = if key.code == KeyCode::Up {
                     selected.saturating_sub(1)

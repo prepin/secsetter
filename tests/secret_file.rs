@@ -75,6 +75,10 @@ destination = "$XDG_CONFIG_HOME/secrets/token"
         success(self.command().arg("list").output().unwrap())
     }
 
+    fn clear(&self, id: &str) -> Output {
+        self.command().args(["clear", id]).output().unwrap()
+    }
+
     fn fnox_stub(&self, body: &str) {
         let executable = self.root.join("fnox");
         fs::write(
@@ -315,6 +319,7 @@ fn refuses_empty_input_and_unsafe_destinations_without_revealing_secrets() {
     symlink(&target, &destination).unwrap();
     assert!(config.list().contains("Blocked"));
     assert_failure(config.set(incoming), "Blocked");
+    assert_failure(config.clear("token"), "symbolic link");
     assert!(destination.is_symlink());
     assert_private_file(&target, old);
 
@@ -322,6 +327,7 @@ fn refuses_empty_input_and_unsafe_destinations_without_revealing_secrets() {
     fs::create_dir(&destination).unwrap();
     assert!(config.list().contains("Blocked"));
     assert_failure(config.set(incoming), "expected a regular file");
+    assert_failure(config.clear("token"), "expected a regular file");
     assert!(destination.is_dir());
     fs::remove_dir(&destination).unwrap();
 
@@ -331,6 +337,7 @@ fn refuses_empty_input_and_unsafe_destinations_without_revealing_secrets() {
     symlink(&outside, destination.parent().unwrap()).unwrap();
     assert!(config.list().contains("Blocked"));
     assert_failure(config.set(incoming), "symbolic link");
+    assert_failure(config.clear("token"), "symbolic link");
     assert_private_file(&outside.join("token"), old);
 
     let output = config
@@ -460,12 +467,57 @@ key = ["token"]
         Some("new-synthetic-token\n"),
     );
 
+    tui.send(b"\x1b[3~");
+    tui.read_through("Empty this field?");
+    tui.read_through("[ Clear ]");
+    tui.read_through("[ Cancel ]");
+    tui.send(b"\x1b[D\r");
+    tui.read_through("Cleared");
+    assert_eq!(config.list(), "token\tGitLab token\tNot set\n");
+    assert!(
+        fs::read_to_string(config.destination())
+            .unwrap()
+            .contains("# keep")
+    );
+
     tui.send(b"q");
     tui.read_through("\x1b[?2004l");
     assert!(tui.child.wait().unwrap().success());
     let output = String::from_utf8_lossy(&tui.output);
     assert!(!output.contains("synthetic-token"));
     assert!(!output.contains("discard-me"));
+}
+
+#[test]
+fn tui_clear_requires_approval_and_removes_the_whole_file() {
+    let config = Fixture::new();
+    success(config.set(b"synthetic"));
+    let mut tui = config.open_tui();
+    tui.read_through("Del clear");
+    tui.send(b"\x1b[3~");
+    tui.read_through("Remove this file?");
+    tui.resize(32, 8);
+    tui.read_through("Remove this file?");
+    tui.read_through("…/token");
+    tui.read_through("[Clear]");
+    tui.read_through("›");
+    tui.read_through("[Cancel]");
+    tui.send(b"\r");
+    tui.read_through("canceled");
+    assert_private_file(&config.destination(), b"synthetic");
+
+    tui.send(b"\x1b[3~");
+    tui.read_through("Remove this file?");
+    tui.send(b"y");
+    tui.read_through("Cleared");
+    assert!(!config.destination().exists());
+    assert!(config.list().contains("Not set"));
+    tui.send(b"\x1b[3~");
+    tui.read_through("Nothing");
+    assert!(!config.destination().exists());
+    tui.send(b"q");
+    assert!(tui.child.wait().unwrap().success());
+    assert_eq!(success(config.clear("token")), "Cleared\n");
 }
 
 #[test]
@@ -556,6 +608,7 @@ destination = "$XDG_CONFIG_HOME/secrets/token"
     let destination = config.destination();
     let mut tui = config.open_tui();
     tui.read_through("○ Not installed");
+    assert_failure(config.clear("template"), "clear does not match");
 
     tui.send(b"\r");
     tui.read_through("Install config?");
@@ -625,6 +678,13 @@ fn tui_restores_a_missing_file_and_asks_before_replacing_an_empty_file() {
     assert!(!String::from_utf8_lossy(&tui.output).contains("synthetic-fnox"));
     tui.send(b"q");
     assert!(tui.child.wait().unwrap().success());
+
+    fs::remove_file(&called).unwrap();
+    assert_eq!(success(config.clear("profile")), "Cleared\n");
+    assert!(!destination.exists());
+    assert!(!called.exists());
+    success(config.restore(false));
+    assert_private_file(&destination, b"synthetic-fnox\n");
 }
 
 fn terminal() -> (File, File) {

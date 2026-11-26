@@ -133,9 +133,6 @@ pub(crate) fn run_helper(args: &[OsString]) -> Result<(), String> {
             return Err("privileged destination must be absolute".into());
         }
         let bytes = read_frame(&mut socket)?;
-        if bytes.is_empty() && !matches!(operation, FileWrite::Create) {
-            return Err("secret input is empty".into());
-        }
         let ownership = lookup_ownership(owner, group)?;
         operation.apply(path, Some(ownership), &bytes)
     })();

@@ -55,6 +55,10 @@ fn run() -> Result<(), String> {
                 App::load()?.perform(id, Action::Set(&mut stdin.lock()))?
             );
         }
+        [command, id] if command == "clear" => {
+            let id = id.to_str().ok_or("entry ID must be UTF-8")?;
+            println!("{}", App::load()?.perform(id, Action::Clear)?);
+        }
         [command, id] if command == "login" => {
             let id = id.to_str().ok_or("entry ID must be UTF-8")?;
             let app = App::load()?;
@@ -71,7 +75,7 @@ fn run() -> Result<(), String> {
         }
         _ => {
             return Err(
-                "usage: secsetter [list | install <id> | set <id> | restore <id> [--replace] | login <id>]"
+                "usage: secsetter [list | install <id> | set <id> | clear <id> | restore <id> [--replace] | login <id>]"
                     .into(),
             );
         }
