@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod file_write;
 mod fnox;
+mod help;
 mod login;
 mod paths;
 mod privileged;
@@ -36,6 +37,9 @@ fn run() -> Result<ExitCode, String> {
         [command, args @ ..] if config_path.is_none() && command == privileged::HELPER => {
             privileged::run_helper(args)?
         }
+        [flag] if flag == "--help" => help::print(),
+        [command, flag] if flag == "--help" => help::print_command(command)?,
+        [command] if command == "skill" => print!("{}", help::SKILL),
         [] => tui::run(&App::load(config_path)?).map_err(|error| format!("terminal: {error}"))?,
         [command] if command == "validate" => {
             config::Config::load(config_path)?;
@@ -92,10 +96,10 @@ fn run() -> Result<ExitCode, String> {
             restore(config_path, id, true)?;
         }
         _ => {
-            return Err(
-                "usage: secsetter [-c <file>] [validate | list | install <id> | set <id> | clear <id> | restore <id> [--replace] | login <id>]"
-                    .into(),
-            );
+            return Err(format!(
+                "{}\nRun 'secsetter --help' to see the commands.",
+                help::USAGE
+            ));
         }
     }
     Ok(ExitCode::SUCCESS)
