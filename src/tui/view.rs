@@ -18,6 +18,7 @@ const ACCENT: Color = Color::Cyan;
 const STATUS_WIDTH: usize = 15;
 const LOGIN_STATUS_WIDTH: usize = 18;
 const WRAP: Wrap = Wrap { trim: true };
+pub(super) const SHRUG: &str = r"¯\_(ツ)_/¯";
 
 #[derive(Clone, Copy)]
 pub(super) enum Panel<'a> {
@@ -255,9 +256,9 @@ fn badge(status: &Status) -> (&'static str, Color) {
         Status::LoginConfigured => ("✓ Login configured", Color::Green),
         Status::LoginNeeded => ("○ Login needed", Color::Yellow),
         Status::Blocked(_) => ("! Blocked", Color::Red),
-        Status::Unknown(_) | Status::CheckError(_) => ("? Unknown", Color::Yellow),
+        Status::Unknown(_) | Status::CheckError(_) => (SHRUG, Color::Yellow),
         Status::Checking => ("… Checking", Color::Yellow),
-        Status::Untracked => ("→", ACCENT),
+        Status::Untracked => (SHRUG, ACCENT),
     }
 }
 
@@ -320,11 +321,7 @@ fn render_details(frame: &mut Frame, area: Rect, entry: &Entry, status: &Status)
     frame.render_widget(
         Paragraph::new(vec![
             fit(&entry.label, usize::from(area.width)).bold().into(),
-            if matches!(status, Status::Untracked) {
-                "→ Login action".fg(ACCENT).into()
-            } else {
-                badge.fg(color).into()
-            },
+            badge.fg(color).into(),
             Line::default(),
             "Next action".fg(ACCENT).into(),
             action.into(),

@@ -174,7 +174,8 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
                     match app.status(entry) {
                         Status::Set => confirm = Some(Confirmation::new("Clear", Action::Clear)),
                         Status::NotSet => notice = "Nothing to clear: secret is not set".into(),
-                        status @ (Status::Blocked(_) | Status::Unknown(_)) => {
+                        Status::Unknown(error) => notice = format!("{}: {error}", view::SHRUG),
+                        status @ Status::Blocked(_) => {
                             notice = status.to_string();
                         }
                         _ => notice = "Only secrets can be cleared".into(),

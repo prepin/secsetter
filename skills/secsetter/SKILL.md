@@ -138,7 +138,7 @@ ready_when = [
 
 - For `secret-field` and `field-set`, choose `format = "toml"`, `"yaml"`, or `"json"`. List each key as a separate string. A dot within a key is literal. Key paths cannot traverse arrays. To set a field, the file and all parent objects must exist.
 - A login entry requires `commands`, even for one step: `commands = [["example", "login"]]`. Each step starts with an executable. SecSetter passes the remaining arguments literally and does not interpret shell syntax. Steps run in order and stop at the first failure or interruption.
-- If `ready_when` is absent or empty (`[]`), SecSetter shows no login status. If all checks pass, SecSetter shows **Login configured**. If any required file or value is absent, SecSetter shows **Login needed**. If SecSetter cannot complete a check and none fail, it shows **Unknown**.
+- If all checks pass, SecSetter shows **Login configured**. If a check fails, it shows **Login needed**. If a check cannot determine the status and none fail, the status is **Unknown**. The terminal UI shows `¯\_(ツ)_/¯` for unknown status or when `ready_when` is absent or empty (`[]`). `secsetter list` uses **Unknown** for an unknown status and omits the status column when there are no checks.
 - A `file-exists` check accepts an empty regular file. A `field-set` check requires a non-empty string.
 - File checks describe local files. A command check reports the status that the command returns. A login action can run regardless of its status.
 
