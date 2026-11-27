@@ -16,6 +16,16 @@ SecSetter can write a whole secret file or update a single string field in TOML,
 
 ## Install
 
+### mise (recommended)
+
+Install the latest release globally with [mise](https://mise.jdx.dev/):
+
+```sh
+mise use -g github:prepin/secsetter@latest
+```
+
+### Manual download
+
 Download an archive and `SHA256SUMS` from [GitHub Releases](https://github.com/prepin/secsetter/releases).
 
 | System | Archive |
