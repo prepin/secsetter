@@ -29,6 +29,9 @@ Default config: $XDG_CONFIG_HOME/secsetter/config.toml, or
 ~/.config/secsetter/config.toml if XDG_CONFIG_HOME is unset or empty.
 
 Validate a draft: secsetter -c ./draft.toml validate
+Group related entries in the terminal UI with section = \"VPN\".
+Custom sections appear alphabetically before Templates, Secrets, Files, Logins, and Fnox.
+For config examples: secsetter skill
 For command help: secsetter <command> --help"
     );
 }

@@ -27,21 +27,76 @@ impl Confirmation {
     }
 }
 
+enum Row<'a> {
+    Heading(&'a str),
+    Entry(&'a Entry),
+}
+
+impl<'a> Row<'a> {
+    fn entry(&self) -> Option<&'a Entry> {
+        match self {
+            Self::Heading(_) => None,
+            Self::Entry(entry) => Some(entry),
+        }
+    }
+}
+
+fn grouped_rows(app: &App) -> Vec<Row<'_>> {
+    let mut sections: Vec<(&str, Vec<&Entry>)> = Vec::new();
+    let mut templates = Vec::new();
+    let mut secrets = Vec::new();
+    let mut files = Vec::new();
+    let mut logins = Vec::new();
+    let mut fnox = Vec::new();
+    for entry in app.entries() {
+        if let Some(name) = entry.section.as_deref() {
+            if let Some((_, entries)) = sections.iter_mut().find(|(section, _)| *section == name) {
+                entries.push(entry);
+            } else {
+                sections.push((name, vec![entry]));
+            }
+        } else {
+            match entry.kind {
+                Kind::Template { .. } => templates.push(entry),
+                Kind::SecretField { .. } => secrets.push(entry),
+                Kind::SecretFile { .. } => files.push(entry),
+                Kind::Login { .. } => logins.push(entry),
+                Kind::FnoxFile { .. } => fnox.push(entry),
+            }
+        }
+    }
+    sections.sort_by_cached_key(|(name, _)| name.to_lowercase());
+    sections.extend([
+        ("Templates", templates),
+        ("Secrets", secrets),
+        ("Files", files),
+        ("Logins", logins),
+        ("Fnox", fnox),
+    ]);
+    let mut rows = Vec::new();
+    for (name, entries) in sections
+        .into_iter()
+        .filter(|(_, entries)| !entries.is_empty())
+    {
+        rows.push(Row::Heading(name));
+        rows.extend(entries.into_iter().map(Row::Entry));
+    }
+    rows
+}
+
 pub(crate) fn run(app: &App) -> io::Result<()> {
     let mut screen = Screen::enter()?;
-    let (mut entries, logins): (Vec<_>, Vec<_>) = app
-        .entries()
-        .partition(|entry| !matches!(entry.kind, Kind::Login { .. }));
-    let login_start = (!logins.is_empty()).then_some(entries.len());
-    entries.extend(logins);
-    let mut selected = 0;
+    let rows = grouped_rows(app);
+    let mut selected = rows
+        .iter()
+        .position(|row| row.entry().is_some())
+        .unwrap_or(0);
     let mut confirm: Option<Confirmation> = None;
     let mut notice = String::new();
     loop {
         let view = View {
             app,
-            entries: &entries,
-            login_start,
+            rows: &rows,
             selected,
         };
         let panel = match &confirm {
@@ -70,6 +125,7 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
                 _ => continue,
             }
         }
+        let entry = view.selected_entry();
         if let Some(mut pending) = confirm.take() {
             let approve = match key.code {
                 KeyCode::Char('y' | 'Y') => true,
@@ -87,7 +143,8 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
                 }
             };
             notice = if approve {
-                perform(app, &mut screen, entries[selected], pending.action)?
+                let entry = entry.expect("confirmation requires a selected entry");
+                perform(app, &mut screen, entry, pending.action)?
             } else {
                 format!("{} canceled", pending.verb)
             };
@@ -96,7 +153,7 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
             KeyCode::Delete => {
-                if let Some(entry) = entries.get(selected) {
+                if let Some(entry) = entry {
                     match app.status(entry) {
                         Status::Set => confirm = Some(Confirmation::new("Clear", Action::Clear)),
                         Status::NotSet => notice = "Nothing to clear: secret is not set".into(),
@@ -109,17 +166,22 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
             }
             KeyCode::Up | KeyCode::Down => {
                 let next = if key.code == KeyCode::Up {
-                    selected.saturating_sub(1)
+                    rows[..selected]
+                        .iter()
+                        .rposition(|row| row.entry().is_some())
                 } else {
-                    (selected + 1).min(entries.len().saturating_sub(1))
+                    rows.iter()
+                        .enumerate()
+                        .skip(selected + 1)
+                        .find_map(|(index, row)| row.entry().map(|_| index))
                 };
-                if next != selected {
+                if let Some(next) = next {
                     selected = next;
                     notice.clear();
                 }
             }
             KeyCode::Enter => {
-                if let Some(entry) = entries.get(selected) {
+                if let Some(entry) = entry {
                     match &entry.kind {
                         kind @ (Kind::Template { destination, .. }
                         | Kind::FnoxFile { destination, .. }) => {

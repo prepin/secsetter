@@ -12,6 +12,8 @@ use crate::app::{App, Status};
 use crate::config::{Entry, Kind};
 use crate::paths::PathError;
 
+use super::Row;
+
 const ACCENT: Color = Color::Cyan;
 const STATUS_WIDTH: usize = 15;
 const LOGIN_STATUS_WIDTH: usize = 18;
@@ -29,12 +31,15 @@ pub(super) enum Panel<'a> {
 
 pub(super) struct View<'a> {
     pub app: &'a App,
-    pub entries: &'a [&'a Entry],
-    pub login_start: Option<usize>,
+    pub rows: &'a [Row<'a>],
     pub selected: usize,
 }
 
-impl View<'_> {
+impl<'a> View<'a> {
+    pub fn selected_entry(&self) -> Option<&'a Entry> {
+        self.rows.get(self.selected).and_then(Row::entry)
+    }
+
     pub fn render(&self, frame: &mut Frame, panel: Panel<'_>) -> bool {
         let area = frame.area();
         if area.width < 32 || area.height < 8 {
@@ -51,7 +56,7 @@ impl View<'_> {
         }
 
         let wide = area.width >= 90 && area.height >= 22;
-        let entry = self.entries.get(self.selected).copied();
+        let entry = self.selected_entry();
         let confirmation_destination = entry.and_then(|entry| match &entry.kind {
             Kind::Template { destination, .. }
             | Kind::FnoxFile { destination, .. }
@@ -164,34 +169,34 @@ impl View<'_> {
         selected_status: Option<&Status>,
         popup: Option<Rect>,
     ) {
-        if self.entries.is_empty() {
+        if self.rows.is_empty() {
             frame.render_widget("No entries for this platform".dim(), area);
             return;
         }
-        let selected_row = self.selected
-            + usize::from(self.login_start.is_some_and(|start| start <= self.selected));
         let rows = usize::from(area.height);
         let visible_rows = popup.map_or(rows, |popup| {
             rows.min(usize::from(popup.y.saturating_sub(area.y)))
         });
-        let first = selected_row.saturating_sub(visible_rows.saturating_sub(1));
-        let mut lines = Vec::with_capacity(rows);
-        for row in first..first + rows {
-            if self.login_start == Some(row) {
-                lines.push(Line::from(" Login".fg(ACCENT).bold()));
-                continue;
-            }
-            let index = row - usize::from(self.login_start.is_some_and(|start| start < row));
-            let Some(entry) = self.entries.get(index) else {
-                break;
-            };
-            let selected = index == self.selected;
-            let badge = match selected_status.filter(|_| selected) {
-                Some(status) => badge(status),
-                None => badge(&self.app.status(entry)),
-            };
-            lines.push(entry_line(entry, badge, area.width, selected));
-        }
+        let first = self.selected.saturating_sub(visible_rows.saturating_sub(1));
+        let lines: Vec<_> = self.rows[first..]
+            .iter()
+            .take(rows)
+            .enumerate()
+            .map(|(offset, row)| match row {
+                Row::Heading(name) => {
+                    let name = fit(name, usize::from(area.width.saturating_sub(1)));
+                    Line::from(format!(" {name}").fg(ACCENT).bold())
+                }
+                Row::Entry(entry) => {
+                    let selected = first + offset == self.selected;
+                    let badge = match selected_status.filter(|_| selected) {
+                        Some(status) => badge(status),
+                        None => badge(&self.app.status(entry)),
+                    };
+                    entry_line(entry, badge, area.width, selected)
+                }
+            })
+            .collect();
         frame.render_widget(Paragraph::new(lines), area);
     }
 }

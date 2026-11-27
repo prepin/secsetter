@@ -20,6 +20,22 @@ Validation reads only the config and checks entries for all platforms. It does n
 - Omit `platforms` for an entry that applies everywhere. Use `platforms = ["linux"]` or `platforms = ["macos"]` for a platform-specific entry. Use distinct IDs for separate entries.
 - For a File Entry that needs elevation, set `privileged = true` and specify `owner` and `group`. Use account names that exist on the target platform. Login Actions run as the current user.
 
+## Sections
+
+Set `section = "VPN"` on each entry that belongs in the **VPN** section of the TUI. A section can contain any mix of entry kinds. Names are case-sensitive and cannot be blank or contain control characters.
+
+Custom sections appear first, in alphabetical order without regard to case. Entries without `section` appear in these default sections, in order:
+
+| Section | Entry kind |
+| --- | --- |
+| Templates | `template` |
+| Secrets | `secret-field` |
+| Files | `secret-file` |
+| Logins | `login` |
+| Fnox | `fnox-file` |
+
+The TUI omits empty sections. Entries within each section keep their config order. `secsetter list` keeps the original config order.
+
 ## Example config
 
 Copy the entries that match the task. Replace example IDs, paths, keys, and commands with the actual values.
@@ -54,6 +70,7 @@ destination = "$XDG_CONFIG_HOME/example/token"
 id = "vpn-profile"
 label = "VPN profile"
 kind = "fnox-file"
+section = "VPN"
 source = "vpn/example.conf"
 destination = "/etc/wireguard/example.conf"
 platforms = ["linux"]

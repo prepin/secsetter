@@ -26,6 +26,7 @@ struct ConfigFile {
 pub(crate) struct Entry {
     pub id: String,
     pub label: String,
+    pub section: Option<String>,
     platforms: Option<Vec<Platform>>,
     #[serde(default)]
     privileged: bool,
@@ -151,6 +152,13 @@ impl Config {
             }
             if !ids.insert(id) {
                 return Err(invalid("duplicate id"));
+            }
+            if entry.section.as_deref().is_some_and(|section| {
+                section.trim().is_empty() || section.chars().any(char::is_control)
+            }) {
+                return Err(invalid(
+                    "section must be non-blank and contain no control characters",
+                ));
             }
             if let Kind::SecretField { key, .. } = &entry.kind {
                 validate_key(key).map_err(invalid)?;

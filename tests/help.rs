@@ -27,6 +27,7 @@ fn help_is_available_without_a_config() {
     let global = stdout(secsetter(root, &["--help"]));
     assert!(global.contains("secsetter -c ./draft.toml validate"));
     assert!(global.contains("$XDG_CONFIG_HOME/secsetter/config.toml"));
+    assert!(global.contains("section = \"VPN\""));
     assert_eq!(
         stdout(secsetter(root, &["-c", "missing.toml", "--help"])),
         global
@@ -59,6 +60,7 @@ fn skill_prints_a_working_config_example_without_loading_a_config() {
     let root = directory.path();
     let guide = stdout(secsetter(root, &["skill"]));
     assert!(guide.contains("secsetter -c ./draft.toml validate"));
+    assert!(guide.contains("section = \"VPN\""));
     assert_eq!(
         stdout(secsetter(root, &["-c", "missing.toml", "skill"])),
         guide

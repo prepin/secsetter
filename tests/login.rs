@@ -220,6 +220,135 @@ printf 'Read second answer\n'
 "#;
 
 #[test]
+fn tui_groups_related_entries_and_skips_headings_when_selecting_an_action() {
+    let other_platform = if cfg!(target_os = "linux") {
+        "macos"
+    } else {
+        "linux"
+    };
+    let config = ConfigDir::new(&format!(
+        r#"
+[[entries]]
+id = "fallback-login"
+label = "Fallback sign-in"
+kind = "login"
+commands = [["/bin/true"]]
+
+[[entries]]
+id = "fallback-fnox"
+label = "Backup file"
+kind = "fnox-file"
+source = "~/mock-backup"
+destination = "$XDG_CONFIG_HOME/backup"
+
+{TEMPLATE}
+section = "VPN"
+
+[[entries]]
+id = "hidden"
+label = "Other platform"
+kind = "login"
+section = "Hidden section"
+platforms = ["{other_platform}"]
+commands = [["/bin/true"]]
+
+[[entries]]
+id = "git-token"
+label = "Registry token"
+kind = "secret-file"
+section = "git creds"
+destination = "$XDG_CONFIG_HOME/registry-token"
+
+[[entries]]
+id = "vpn-login"
+label = "VPN sign-in"
+kind = "login"
+section = "VPN"
+commands = [["/bin/echo", "Ran the VPN sign-in"]]
+
+[[entries]]
+id = "ungrouped"
+label = "Ungrouped file"
+kind = "secret-file"
+destination = "$XDG_CONFIG_HOME/ungrouped"
+
+[[entries]]
+id = "fallback-field"
+label = "API field"
+kind = "secret-field"
+format = "toml"
+key = ["token"]
+destination = "$XDG_CONFIG_HOME/settings.toml"
+
+[[entries]]
+id = "fallback-template"
+label = "Editor config"
+kind = "template"
+source = "editor.toml"
+destination = "$XDG_CONFIG_HOME/editor.toml"
+"#
+    ));
+    let list = config.command().arg("list").output().unwrap();
+    assert!(list.status.success());
+    assert_eq!(
+        list.stdout,
+        b"fallback-login\tFallback sign-in\nfallback-fnox\tBackup file\tNot set\n\
+          example-template\tExample config\tNot installed\ngit-token\tRegistry token\tNot set\n\
+          vpn-login\tVPN sign-in\nungrouped\tUngrouped file\tNot set\n\
+          fallback-field\tAPI field\tNot set\nfallback-template\tEditor config\tNot installed\n"
+    );
+
+    let mut pty = Terminal::launch(config.command());
+    let listed = pty.expect("Backup");
+    let mut remaining = listed.as_str();
+    for text in [
+        " git creds",
+        "› Registry token",
+        " VPN",
+        "Example",
+        "sign-in",
+        " Templates",
+        "Editor",
+        " Secrets",
+        "API",
+        " Files",
+        "Ungrouped",
+        " Logins",
+        "Fallback",
+        " Fnox",
+        "Backup",
+    ] {
+        remaining = remaining
+            .split_once(text)
+            .unwrap_or_else(|| panic!("missing {text:?}"))
+            .1;
+    }
+    assert!(!listed.contains("Hidden section"));
+
+    pty.send(b"\x1b[B");
+    pty.expect("› Example config");
+    pty.send(b"\x1b[B");
+    pty.expect("› VPN sign-in");
+    pty.send(b"\x1b[B");
+    pty.expect("› Editor config");
+    pty.send(b"\x1b[A");
+    pty.expect("› VPN sign-in");
+    pty.send(b"\r");
+    assert!(pty.expect("completed").contains("Ran the VPN sign-in"));
+    pty.quit();
+}
+
+#[test]
+fn validate_rejects_blank_or_multiline_section_names() {
+    for section in [r#"section = " ""#, r#"section = "VPN\nLogin""#] {
+        let config = ConfigDir::new(&format!("{TEMPLATE}{section}"));
+        let output = config.command().arg("validate").output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("section must be non-blank"));
+    }
+}
+
+#[test]
 fn tui_returns_to_the_list_after_an_interactive_login_succeeds() {
     let config = ConfigDir::new(&format!(
         r#"{INTERACTIVE_LOGIN}

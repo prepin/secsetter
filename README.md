@@ -4,7 +4,7 @@
 
 SecSetter gives you one terminal screen for the setup steps that still need you: install a config, paste an API token, restore a private file, or sign in to a service. The list shows what is in place and what still needs attention.
 
-![SecSetter terminal UI with an installed config, missing secrets, and a GitHub sign-in that needs attention. The right pane shows the next action.](docs/secsetter.png)
+![SecSetter terminal UI with Git Creds and VPN sections above the default sections. GitHub sign-in is selected and marked Login needed.](docs/secsetter.png)
 
 ## When to use it
 
@@ -49,6 +49,10 @@ Check the archive against `SHA256SUMS` with `sha256sum <archive>` on Linux or `s
 
 The default config is `$XDG_CONFIG_HOME/secsetter/config.toml`. If `XDG_CONFIG_HOME` is unset or empty, the default is `~/.config/secsetter/config.toml`.
 
+## Organize entries
+
+Add `section = "Git Creds"` to each related `[[entries]]` table to show a config, a token, and a sign-in together. Custom sections appear first, in alphabetical order. Entries without a section go under **Templates**, **Secrets** (fields), **Files** (whole-file secrets), **Logins**, or **Fnox**. Empty sections stay hidden.
+
 ## Command line
 
 Each entry has an ID for use in scripts. The `validate` command checks the config without running any of its actions.
@@ -68,7 +72,7 @@ Use `cargo test --locked` to run the test suite. For bug reports and feature req
 
 ## Release
 
-Update the version in `Cargo.toml` and refresh `Cargo.lock`. Merge the changes into `master`. When CI passes, push a matching version tag such as `v1.0.0`. GitHub Actions builds and tests all three targets before it publishes the archives and checksums.
+Update the version in `Cargo.toml` and refresh `Cargo.lock`. Merge the changes into `master`. When CI passes, push a matching version tag such as `v1.1.0`. GitHub Actions builds and tests all three targets before it publishes the archives and checksums.
 
 ## License
 
