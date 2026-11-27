@@ -40,6 +40,7 @@ Config options:
               list, or press Ctrl+O or click Open token page in the popup.
   commands    Set the ordered steps of a login entry as arrays of literal arguments.
   ready_when  Set optional login checks: file-exists, field-set, and command.
+              Add json.matches to a command check to match JSON output.
               list and the terminal UI run command checks from the config.
 
 Validate a draft: secsetter -c ./draft.toml validate
@@ -94,7 +95,9 @@ Set commands as arrays: commands = [[\"example\", \"login\"]].
 Each step starts with an executable and passes its remaining arguments literally.
 SecSetter does not interpret shell syntax. It stops at the first failure or interruption.
 If you set ready_when checks and all pass, list shows Login configured.
-A command check passes on exit 0. Other checks look at local files.
+A command check passes on exit 0 by default. If it sets json.matches, stdout
+must match that pattern too. Use on_miss = \"login-needed\" for a valid nonmatch.
+If a JSON check fails to run or return the expected output shape, it reports Unknown.
 Readiness checks do not prevent login. For examples, run 'secsetter skill'.",
         ),
         Some("skill") => (

@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use rustix::fs::{self, Mode, OFlags};
 use serde::Deserialize;
 
+use crate::login::JsonCheck;
 use crate::secret_field::{Format, validate_key};
 
 pub(crate) struct Config {
@@ -76,6 +77,7 @@ pub(crate) enum LoginCheck {
     },
     Command {
         command: Vec<String>,
+        json: Option<JsonCheck>,
     },
 }
 
@@ -245,10 +247,13 @@ impl Config {
                                 validate_key(key).map_err(invalid_check)?;
                                 path
                             }
-                            LoginCheck::Command { command } => {
+                            LoginCheck::Command { command, json } => {
                                 validate_command(command).map_err(|reason| {
                                     invalid_check(&format!("command {reason}"))
                                 })?;
+                                if let Some(json) = json {
+                                    json.validate().map_err(invalid_check)?;
+                                }
                                 continue;
                             }
                         };

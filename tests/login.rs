@@ -129,12 +129,143 @@ fn rejects_invalid_login_checks_at_config_load() {
         r#"{ kind = "command", command = [] }"#,
         r#"{ kind = "command", command = [""] }"#,
         r#"{ kind = "command", command = ["sh", "\u0000"] }"#,
+        r#"{ kind = "command", command = ["sh"], json = {} }"#,
+        r#"{ kind = "command", command = ["sh"], json = { matches = [], on_miss = "login-needed" } }"#,
+        r#"{ kind = "command", command = ["sh"], json = { matches = [{}, {}] } }"#,
+        r#"{ kind = "command", command = ["sh"], json = { matches = { at = 2026-01-01 } } }"#,
+        r#"{ kind = "command", command = ["sh"], json = { matches = inf } }"#,
+        r#"{ kind = "command", command = ["sh"], json = { matches = true, on_miss = "fail" } }"#,
     ] {
         let config = ConfigDir::new(&format!("{LOGIN}\nready_when = [{check}]"));
-        let output = config.command().arg("list").output().unwrap();
+        let output = config.command().arg("validate").output().unwrap();
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
         assert!(String::from_utf8_lossy(&output.stderr).contains("invalid"));
+    }
+}
+
+#[test]
+fn json_command_checks_match_saved_oauth_without_exposing_output() {
+    let config = ConfigDir::new(&format!(
+        r#"{LOGIN}
+ready_when = [
+  {{ kind = "command", command = ["/bin/sh", "-c", '''
+    : > "$XDG_CONFIG_HOME/check-ran"
+    printf 'do-not-print-stderr' >&2
+    printf '%s' "$PROBE_OUTPUT"
+    exit "$PROBE_EXIT"
+  '''], json = {{ matches = [{{ id = "openai", connections = [{{ type = "credential", method = "oauth" }}] }}], on_miss = "login-needed" }} }},
+]
+"#
+    ));
+    let validate = config.command().arg("validate").output().unwrap();
+    assert!(validate.status.success(), "{validate:?}");
+    assert!(!config.0.path().join("check-ran").exists());
+
+    let oauth = r#"[{"id":"other"},{"id":"openai","connections":[{"type":"credential","method":"oauth","label":"do-not-print"}]}]"#;
+    for (payload, exit, expected) in [
+        (oauth, "0", "Login configured"),
+        (oauth, "1", "Unknown:"),
+        ("[]", "0", "Login needed"),
+        (
+            r#"[{"id":"openai","connections":[{"type":"credential","method":"api-key"}]},{"id":"other","connections":[{"type":"credential","method":"oauth"}]}]"#,
+            "0",
+            "Login needed",
+        ),
+        (
+            r#"[{"id":"openai","connections":[{"type":"credential","method":"api-key"},{"type":"different","method":"oauth"}]}]"#,
+            "0",
+            "Login needed",
+        ),
+        (r#"[{"id":"openai"}]"#, "0", "Unknown:"),
+        (
+            r#"[{"id":"openai","connections":[{"type":"credential","method":42}]}]"#,
+            "0",
+            "Unknown:",
+        ),
+        (
+            r#"{"id":"openai","secret":"do-not-print"}"#,
+            "0",
+            "Unknown:",
+        ),
+        ("do-not-print-invalid-json", "0", "Unknown:"),
+    ] {
+        let output = config
+            .command()
+            .arg("list")
+            .env("PROBE_OUTPUT", payload)
+            .env("PROBE_EXIT", exit)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && output.stderr.is_empty(),
+            "{output:?}"
+        );
+        let status = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            status.starts_with(&format!("demo\tSynthetic sign-in\t{expected}")),
+            "{status:?}"
+        );
+        assert!(!status.contains("do-not-print"));
+    }
+}
+
+#[test]
+fn gitlab_shaped_json_checks_keep_ambiguous_errors_unknown_and_bound_output() {
+    let config = ConfigDir::new(&format!(
+        r#"{LOGIN}
+ready_when = [
+  {{ kind = "command", command = ["/bin/sh", "-c", 'cat "$XDG_CONFIG_HOME/output"; exit "$PROBE_EXIT"'], json = {{ matches = {{ hosts = [{{ host = "gitlab.example.com", state = "success" }}] }} }} }},
+]
+"#
+    ));
+    let success = r#"{"hosts":[{"host":"gitlab.example.com","state":"success"}]}"#;
+    let rejected =
+        r#"{"hosts":[{"host":"gitlab.example.com","state":"error","error":"401: do-not-print"}]}"#;
+    let unreachable =
+        r#"{"hosts":[{"host":"gitlab.example.com","state":"error","error":"connection refused"}]}"#;
+    let limit = 64 * 1024;
+    let full = format!("{success}{}", " ".repeat(limit - success.len()));
+    let oversized = format!("{full} ");
+    for (payload, exit, expected) in [
+        (success, "0", "Login configured\n"),
+        (
+            rejected,
+            "1",
+            "Unknown: ready_when command 1: exit status: 1\n",
+        ),
+        (
+            unreachable,
+            "1",
+            "Unknown: ready_when command 1: exit status: 1\n",
+        ),
+        (
+            rejected,
+            "0",
+            "Unknown: ready_when command 1: JSON pattern did not match\n",
+        ),
+        (&full, "0", "Login configured\n"),
+        (
+            &oversized,
+            "0",
+            "Unknown: ready_when command 1: JSON output exceeds 64 KiB\n",
+        ),
+    ] {
+        fs::write(config.0.path().join("output"), payload).unwrap();
+        let output = config
+            .command()
+            .arg("list")
+            .env("PROBE_EXIT", exit)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && output.stderr.is_empty(),
+            "{output:?}"
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("demo\tSynthetic sign-in\t{expected}")
+        );
     }
 }
 
@@ -224,7 +355,7 @@ ready_when = [
 fn list_times_out_slow_command_checks() {
     let config = ConfigDir::new(&format!(
         r#"{LOGIN}
-ready_when = [{{ kind = "command", command = ["/bin/sh", "-c", "sleep 15 & wait"] }}]
+ready_when = [{{ kind = "command", command = ["/bin/sh", "-c", "printf true; sleep 15 & wait"], json = {{ matches = true }} }}]
 "#
     ));
     let start = Instant::now();

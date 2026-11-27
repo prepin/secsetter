@@ -1,5 +1,9 @@
+mod json;
+
 use std::ffi::{CStr, CString, c_char};
 use std::fmt;
+use std::io::{PipeReader, PipeWriter, Read};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{ExitCode, ExitStatus};
@@ -7,9 +11,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use std::{env, io, mem, ptr};
 
+use rustix::fs::{self, OFlags};
+
+pub(crate) use json::JsonCheck;
+
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const CHECK_INTERVAL: Duration = Duration::from_millis(25);
+const MAX_CHECK_OUTPUT: usize = 64 * 1024;
 
 pub(crate) struct InterruptGuard(libc::sigaction);
 
@@ -132,43 +141,88 @@ fn status(command: &[String]) -> io::Result<ExitStatus> {
     Ok(wait_status(pid, 0)?.expect("blocking wait returns a status"))
 }
 
-pub(crate) fn check(command: &[String], cancelled: impl Fn() -> bool) -> io::Result<bool> {
+pub(crate) fn check(
+    command: &[String],
+    json: Option<&JsonCheck>,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<bool> {
     if cancelled() {
         return Err(io::ErrorKind::Interrupted.into());
     }
-    let pid = spawn_check(command)?;
+    let (pid, mut reader) = if json.is_some() {
+        let (reader, writer) = io::pipe()?;
+        fs::fcntl_setfl(&reader, OFlags::NONBLOCK)?;
+        (spawn_check(command, Some(&writer))?, Some(reader))
+    } else {
+        (spawn_check(command, None)?, None)
+    };
+    let mut output = Vec::new();
     let start = Instant::now();
-    loop {
-        if let Some(status) = wait_status(pid, libc::WNOHANG)? {
-            return status
-                .code()
-                .map(|code| code == 0)
-                .ok_or_else(|| io::Error::other(status.to_string()));
+    let error = loop {
+        if let Some(reader) = &mut reader
+            && let Err(error) = read_check_output(reader, &mut output)
+        {
+            break error;
         }
-        let error = if cancelled() {
-            io::ErrorKind::Interrupted.into()
-        } else if start.elapsed() >= CHECK_TIMEOUT {
-            io::Error::new(io::ErrorKind::TimedOut, "timed out after 5 seconds")
-        } else {
-            std::thread::sleep(CHECK_INTERVAL);
-            continue;
-        };
-        // SAFETY: The unreaped child owns this PID. Signal its process group first.
-        let killed =
-            unsafe { libc::kill(-pid, libc::SIGKILL) == 0 || libc::kill(pid, libc::SIGKILL) == 0 };
-        wait_status(pid, if killed { 0 } else { libc::WNOHANG })?;
-        return Err(error);
+        if let Some(status) = wait_status(pid, libc::WNOHANG)? {
+            return match (status.code(), json.zip(reader.as_mut())) {
+                (Some(0), Some((json, reader))) => {
+                    if !read_check_output(reader, &mut output)? {
+                        return Err(io::Error::other("JSON output pipe did not close"));
+                    }
+                    json.evaluate(&output)
+                }
+                (Some(code), None) => Ok(code == 0),
+                _ => Err(io::Error::other(status.to_string())),
+            };
+        }
+        if cancelled() {
+            break io::ErrorKind::Interrupted.into();
+        }
+        if start.elapsed() >= CHECK_TIMEOUT {
+            break io::Error::new(io::ErrorKind::TimedOut, "timed out after 5 seconds");
+        }
+        std::thread::sleep(CHECK_INTERVAL);
+    };
+    // SAFETY: The unreaped child owns this PID. Signal its process group first.
+    let killed =
+        unsafe { libc::kill(-pid, libc::SIGKILL) == 0 || libc::kill(pid, libc::SIGKILL) == 0 };
+    wait_status(pid, if killed { 0 } else { libc::WNOHANG })?;
+    Err(error)
+}
+
+fn read_check_output(reader: &mut PipeReader, output: &mut Vec<u8>) -> io::Result<bool> {
+    let result = reader
+        .take((MAX_CHECK_OUTPUT + 1 - output.len()) as u64)
+        .read_to_end(output);
+    if output.len() > MAX_CHECK_OUTPUT {
+        return Err(io::Error::other("JSON output exceeds 64 KiB"));
+    }
+    match result {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
-fn spawn_check(command: &[String]) -> io::Result<libc::pid_t> {
+fn spawn_check(command: &[String], stdout: Option<&PipeWriter>) -> io::Result<libc::pid_t> {
     // SAFETY: Initialize the spawn settings before use and destroy each initialized object.
     unsafe {
         let mut actions = mem::MaybeUninit::uninit();
         spawn_result(libc::posix_spawn_file_actions_init(actions.as_mut_ptr()))?;
         let mut actions = actions.assume_init();
         let result = (|| {
+            if let Some(stdout) = stdout {
+                spawn_result(libc::posix_spawn_file_actions_adddup2(
+                    &mut actions,
+                    stdout.as_raw_fd(),
+                    libc::STDOUT_FILENO,
+                ))?;
+            }
             for fd in 0..=2 {
+                if fd == libc::STDOUT_FILENO && stdout.is_some() {
+                    continue;
+                }
                 spawn_result(libc::posix_spawn_file_actions_addopen(
                     &mut actions,
                     fd,

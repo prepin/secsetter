@@ -112,6 +112,26 @@ commands = [["codex", "login"]]
 ready_when = [
   { kind = "command", command = ["codex", "login", "status"] },
 ]
+
+# Check for a saved OpenAI OAuth connection in OpenCode.
+[[entries]]
+id = "opencode-login"
+label = "OpenCode OpenAI OAuth"
+kind = "login"
+commands = [["opencode", "auth", "login", "openai"]]
+ready_when = [
+  { kind = "command", command = ["opencode", "auth", "list", "--format", "json"], json = { matches = [{ id = "openai", connections = [{ type = "credential", method = "oauth" }] }], on_miss = "login-needed" } },
+]
+
+# Verify authentication for a specific GitLab host.
+[[entries]]
+id = "gitlab-login"
+label = "GitLab sign-in"
+kind = "login"
+commands = [["glab", "auth", "login", "--hostname", "gitlab.example.com"]]
+ready_when = [
+  { kind = "command", command = ["glab", "auth", "status", "--hostname", "gitlab.example.com", "--output", "json"], json = { matches = { hosts = [{ host = "gitlab.example.com", state = "success" }] } } },
+]
 ```
 
 ## Fields and login checks
@@ -126,6 +146,18 @@ ready_when = [
 
 Use a noninteractive status command from a config you trust. Put the executable first and each argument in its own string. If the check needs shell syntax, specify a shell, such as `sh -c`, in the array.
 
-SecSetter passes the arguments as written. It disconnects standard input and discards standard output and standard error. Exit `0` passes the check. A nonzero exit shows **Login needed**. If the command cannot start, ends by signal, or takes more than five seconds, the result is **Unknown** unless another check fails.
+SecSetter passes the arguments as written. It disconnects standard input and discards standard error. By default it also discards standard output. Exit `0` passes a command check without `json`. A nonzero exit shows **Login needed**. If the command cannot start, ends by signal, or takes more than five seconds, the result is **Unknown** unless another check fails.
 
 `secsetter list` runs the checks each time. The terminal UI caches the status from startup and refreshes it after a login attempt for that entry. `secsetter validate` validates the array without running the command.
+
+### JSON command checks
+
+If the CLI offers JSON, request it in `command` and set `json.matches` to the expected pattern. SecSetter reads up to 64 KiB of standard output into memory. It discards the output after the check and never shows or logs it.
+
+- An object pattern checks the named fields and ignores extra fields.
+- An array pattern must contain one pattern. At least one element in the output array must match that pattern. All fields in an object pattern must match within the same element.
+- Strings, booleans, integers, and finite floats match by type and value. An integer does not match a float.
+
+If the command exits `0` and the JSON matches, the check passes. A compatible response with no match shows **Unknown** by default. Set `on_miss = "login-needed"` inside `json` to report **Login needed** for a compatible response with no match. Invalid JSON, missing fields or wrong types that prevent a decision, and nonzero exits still show **Unknown**.
+
+The OpenCode example checks for a saved OAuth connection. It does not test whether the token still works. The GitLab example checks for a successful status on the specified host. Replace `gitlab.example.com` in the command and pattern with your host. A rejected token or unreachable host can produce the same error status, so the example reports **Unknown** for both.

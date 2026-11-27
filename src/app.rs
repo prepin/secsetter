@@ -237,9 +237,11 @@ pub(crate) fn login_status(checks: &[LoginCheck], cancelled: impl Fn() -> bool) 
                     .map(|_| true),
             ),
             LoginCheck::FieldSet { path, format, key } => file_status(format.is_set(path, key)),
-            LoginCheck::Command { command } => login::check(command, &cancelled).map_err(|error| {
-                Status::CheckError(format!("ready_when command {}: {error}", index + 1))
-            }),
+            LoginCheck::Command { command, json } => {
+                login::check(command, json.as_ref(), &cancelled).map_err(|error| {
+                    Status::CheckError(format!("ready_when command {}: {error}", index + 1))
+                })
+            }
         };
         match result {
             Ok(true) => {}
