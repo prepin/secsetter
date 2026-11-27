@@ -385,13 +385,14 @@ fn render_notice(
     frame.render_widget(block.border_style(Style::new().fg(Color::DarkGray)), area);
     frame.render_widget(Paragraph::new(Line::from(text)).wrap(WRAP), message);
     let keys = match (can_clear, can_open, controls.width) {
-        (true, true, 57..) => "↑/↓ move  Enter open  o token page  Del clear  Esc quit",
-        (true, true, _) => "↑/↓  Enter  o URL  Del  Esc",
-        (false, true, 46..) => "↑/↓ move  Enter open  o token page  Esc quit",
-        (false, true, _) => "↑/↓  Enter  o URL  Esc",
-        (true, false, 46..) => "↑/↓ move  Enter open  Del clear  Esc quit",
-        (true, false, _) => "↑/↓  Enter  Del clear  Esc",
-        (false, false, _) => "↑/↓ move  Enter open  Esc quit",
+        (true, true, 59..) => "↑/↓ j/k move  Enter open  o token page  Del clear  Esc quit",
+        (true, true, _) => "↑/↓ j/k  Enter  o URL  Del Esc",
+        (false, true, 48..) => "↑/↓ j/k move  Enter open  o token page  Esc quit",
+        (false, true, _) => "↑/↓ j/k  Enter  o URL  Esc",
+        (true, false, 45..) => "↑/↓ j/k move  Enter open  Del clear  Esc quit",
+        (true, false, _) => "↑/↓ j/k  Enter  Del clear  Esc",
+        (false, false, 34..) => "↑/↓ j/k move  Enter open  Esc quit",
+        (false, false, _) => "↑/↓ j/k  Enter  Esc",
     };
     frame.render_widget(Line::from(keys.fg(ACCENT)), controls);
 }

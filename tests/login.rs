@@ -325,13 +325,13 @@ destination = "$XDG_CONFIG_HOME/editor.toml"
     }
     assert!(!listed.contains("Hidden section"));
 
-    pty.send(b"\x1b[B");
+    pty.send(b"j");
     pty.expect("› Example config");
     pty.send(b"\x1b[B");
     pty.expect("› VPN sign-in");
     pty.send(b"\x1b[B");
     pty.expect("› Editor config");
-    pty.send(b"\x1b[A");
+    pty.send(b"k");
     pty.expect("› VPN sign-in");
     pty.send(b"\r");
     assert!(pty.expect("completed").contains("Ran the VPN sign-in"));

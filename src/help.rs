@@ -10,6 +10,7 @@ pub(crate) fn print() {
 {USAGE}
 
 Without a command, SecSetter opens the terminal UI.
+Use the arrow keys or j/k to move through the entry list.
 
 Options:
   -c <file>  Select a config file. Relative paths start at the current directory.

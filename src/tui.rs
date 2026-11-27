@@ -176,8 +176,10 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
                     }
                 }
             }
-            KeyCode::Up | KeyCode::Down => {
-                let next = if key.code == KeyCode::Up {
+            KeyCode::Up | KeyCode::Down | KeyCode::Char('j' | 'k')
+                if !matches!(key.code, KeyCode::Char(_)) || key.modifiers.is_empty() =>
+            {
+                let next = if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
                     rows[..selected]
                         .iter()
                         .rposition(|row| row.entry().is_some())
