@@ -19,7 +19,7 @@ Options:
 
 Commands:
   validate                 Validate the config without running any actions.
-  list                     List applicable entries and their local status.
+  list                     List applicable entries and their status.
   install <id> [--replace]  Install a template.
   set <id>                 Write a secret from standard input.
   clear <id>               Clear a secret field or remove a local secret file.
@@ -39,7 +39,8 @@ Config options:
               Use an absolute HTTP(S) URL without credentials. Press o in the
               list, or press Ctrl+O or click Open token page in the popup.
   commands    Set the ordered steps of a login entry as arrays of literal arguments.
-  ready_when  Set optional local login checks: file-exists and field-set.
+  ready_when  Set optional login checks: file-exists, field-set, and command.
+              list and the terminal UI run command checks from the config.
 
 Validate a draft: secsetter -c ./draft.toml validate
 For copyable TOML examples: secsetter skill
@@ -60,9 +61,10 @@ For config examples, run 'secsetter skill'.",
         ),
         Some("list") => (
             "list",
-            "Print tab-separated entry IDs, labels, and local statuses for this platform.
+            "Print tab-separated entry IDs, labels, and statuses for this platform.
 Entries keep their config order regardless of section.
-Login actions without readiness checks omit the status column.",
+Login actions without readiness checks omit the status column.
+Use a trusted config: list runs configured ready_when command checks.",
         ),
         Some("install") => (
             "install <id> [--replace]",
@@ -92,7 +94,8 @@ Set commands as arrays: commands = [[\"example\", \"login\"]].
 Each step starts with an executable and passes its remaining arguments literally.
 SecSetter does not interpret shell syntax. It stops at the first failure or interruption.
 If you set ready_when checks and all pass, list shows Login configured.
-The checks describe local state. They do not verify credentials or prevent login.",
+A command check passes on exit 0. Other checks look at local files.
+Readiness checks do not prevent login. For examples, run 'secsetter skill'.",
         ),
         Some("skill") => (
             "skill",

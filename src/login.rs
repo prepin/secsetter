@@ -4,9 +4,12 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{ExitCode, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use std::{env, io, mem, ptr};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const CHECK_INTERVAL: Duration = Duration::from_millis(25);
 
 pub(crate) struct InterruptGuard(libc::sigaction);
 
@@ -32,7 +35,7 @@ impl InterruptGuard {
         }
     }
 
-    fn interrupted(&self) -> bool {
+    pub(crate) fn interrupted(&self) -> bool {
         INTERRUPTED.load(Ordering::Relaxed)
     }
 }
@@ -125,7 +128,80 @@ pub(crate) fn run(commands: &[Vec<String>], interrupt: &InterruptGuard) -> Resul
 }
 
 fn status(command: &[String]) -> io::Result<ExitStatus> {
-    let pid = launch(command, |path, argv| {
+    let pid = spawn(command, ptr::null(), ptr::null())?;
+    Ok(wait_status(pid, 0)?.expect("blocking wait returns a status"))
+}
+
+pub(crate) fn check(command: &[String], cancelled: impl Fn() -> bool) -> io::Result<bool> {
+    if cancelled() {
+        return Err(io::ErrorKind::Interrupted.into());
+    }
+    let pid = spawn_check(command)?;
+    let start = Instant::now();
+    loop {
+        if let Some(status) = wait_status(pid, libc::WNOHANG)? {
+            return status
+                .code()
+                .map(|code| code == 0)
+                .ok_or_else(|| io::Error::other(status.to_string()));
+        }
+        let error = if cancelled() {
+            io::ErrorKind::Interrupted.into()
+        } else if start.elapsed() >= CHECK_TIMEOUT {
+            io::Error::new(io::ErrorKind::TimedOut, "timed out after 5 seconds")
+        } else {
+            std::thread::sleep(CHECK_INTERVAL);
+            continue;
+        };
+        // SAFETY: The unreaped child owns this PID. Signal its process group first.
+        let killed =
+            unsafe { libc::kill(-pid, libc::SIGKILL) == 0 || libc::kill(pid, libc::SIGKILL) == 0 };
+        wait_status(pid, if killed { 0 } else { libc::WNOHANG })?;
+        return Err(error);
+    }
+}
+
+fn spawn_check(command: &[String]) -> io::Result<libc::pid_t> {
+    // SAFETY: Initialize the spawn settings before use and destroy each initialized object.
+    unsafe {
+        let mut actions = mem::MaybeUninit::uninit();
+        spawn_result(libc::posix_spawn_file_actions_init(actions.as_mut_ptr()))?;
+        let mut actions = actions.assume_init();
+        let result = (|| {
+            for fd in 0..=2 {
+                spawn_result(libc::posix_spawn_file_actions_addopen(
+                    &mut actions,
+                    fd,
+                    c"/dev/null".as_ptr(),
+                    libc::O_RDWR,
+                    0,
+                ))?;
+            }
+            let mut attrs = mem::MaybeUninit::uninit();
+            spawn_result(libc::posix_spawnattr_init(attrs.as_mut_ptr()))?;
+            let mut attrs = attrs.assume_init();
+            let result = spawn_result(libc::posix_spawnattr_setpgroup(&mut attrs, 0))
+                .and_then(|()| {
+                    spawn_result(libc::posix_spawnattr_setflags(
+                        &mut attrs,
+                        libc::POSIX_SPAWN_SETPGROUP as libc::c_short,
+                    ))
+                })
+                .and_then(|()| spawn(command, &actions, &attrs));
+            libc::posix_spawnattr_destroy(&mut attrs);
+            result
+        })();
+        libc::posix_spawn_file_actions_destroy(&mut actions);
+        result
+    }
+}
+
+fn spawn(
+    command: &[String],
+    actions: *const libc::posix_spawn_file_actions_t,
+    attrs: *const libc::posix_spawnattr_t,
+) -> io::Result<libc::pid_t> {
+    launch(command, |path, argv| {
         let mut pid = 0;
         // SAFETY: The pointers are live and NUL-terminated. SecSetter does not mutate its environment.
         let error = unsafe {
@@ -140,23 +216,33 @@ fn status(command: &[String]) -> io::Result<ExitStatus> {
             libc::posix_spawn(
                 &mut pid,
                 path.as_ptr(),
-                ptr::null(),
-                ptr::null(),
+                actions,
+                attrs,
                 argv.as_ptr().cast(),
                 environment,
             )
         };
-        if error != 0 {
-            return Err(io::Error::from_raw_os_error(error));
-        }
+        spawn_result(error)?;
         Ok(pid)
-    })?;
+    })
+}
 
+fn spawn_result(error: libc::c_int) -> io::Result<()> {
+    if error == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(error))
+    }
+}
+
+fn wait_status(pid: libc::pid_t, options: libc::c_int) -> io::Result<Option<ExitStatus>> {
     let mut status = 0;
     loop {
         // SAFETY: pid is the child returned by posix_spawn and status is writable.
-        if unsafe { libc::waitpid(pid, &mut status, 0) } != -1 {
-            return Ok(ExitStatus::from_raw(status));
+        match unsafe { libc::waitpid(pid, &mut status, options) } {
+            0 => return Ok(None),
+            -1 => {}
+            _ => return Ok(Some(ExitStatus::from_raw(status))),
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {

@@ -5,6 +5,7 @@ use std::path::Path;
 use crate::config::{Config, Entry, Kind, LoginCheck};
 use crate::file_write::{FileWrite, Outcome};
 use crate::fnox;
+use crate::login;
 use crate::paths::{self, Location, PathError};
 use crate::privileged;
 
@@ -24,6 +25,8 @@ pub(crate) enum Status {
     LoginNeeded,
     Blocked(PathError),
     Unknown(PathError),
+    CheckError(String),
+    Checking,
     Untracked,
 }
 
@@ -38,6 +41,8 @@ impl fmt::Display for Status {
             Self::LoginNeeded => f.write_str("Login needed"),
             Self::Blocked(error) => write!(f, "Blocked: {error}"),
             Self::Unknown(error) => write!(f, "Unknown: {error}"),
+            Self::CheckError(error) => write!(f, "Unknown: {error}"),
+            Self::Checking => f.write_str("Checking"),
             Self::Untracked => Ok(()),
         }
     }
@@ -79,7 +84,10 @@ impl App {
                     Err(error) => Status::Unknown(error),
                 };
             }
-            Kind::Login { ready_when, .. } => return login_status(ready_when),
+            Kind::Login { ready_when, .. } if entry.command_readiness().is_none() => {
+                return login_status(ready_when, || false);
+            }
+            Kind::Login { .. } => return Status::Checking,
         };
         match Location::destination(destination, false).and_then(|file| file.regular_file()) {
             Ok(_) if template => Status::Installed,
@@ -211,28 +219,37 @@ impl App {
     }
 }
 
-fn login_status(checks: &[LoginCheck]) -> Status {
+pub(crate) fn login_status(checks: &[LoginCheck], cancelled: impl Fn() -> bool) -> Status {
     if checks.is_empty() {
         return Status::Untracked;
     }
 
+    let file_status = |result| match result {
+        Err(PathError::Missing(_)) => Ok(false),
+        result => result.map_err(Status::Unknown),
+    };
     let mut unknown = None;
-    for check in checks {
+    for (index, check) in checks.iter().enumerate() {
         let result = match check {
-            LoginCheck::FileExists { path } => Location::destination(path, false)
-                .and_then(|location| location.regular_file())
-                .map(|_| true),
-            LoginCheck::FieldSet { path, format, key } => format.is_set(path, key),
+            LoginCheck::FileExists { path } => file_status(
+                Location::destination(path, false)
+                    .and_then(|location| location.regular_file())
+                    .map(|_| true),
+            ),
+            LoginCheck::FieldSet { path, format, key } => file_status(format.is_set(path, key)),
+            LoginCheck::Command { command } => login::check(command, &cancelled).map_err(|error| {
+                Status::CheckError(format!("ready_when command {}: {error}", index + 1))
+            }),
         };
         match result {
             Ok(true) => {}
-            Ok(false) | Err(PathError::Missing(_)) => return Status::LoginNeeded,
-            Err(error) => {
-                unknown.get_or_insert(error);
+            Ok(false) => return Status::LoginNeeded,
+            Err(status) => {
+                unknown.get_or_insert(status);
             }
         }
     }
-    unknown.map_or(Status::LoginConfigured, Status::Unknown)
+    unknown.unwrap_or(Status::LoginConfigured)
 }
 
 pub(crate) enum CopyDestination {

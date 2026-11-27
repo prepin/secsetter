@@ -102,6 +102,16 @@ ready_when = [
   { kind = "file-exists", path = "$XDG_CONFIG_HOME/example/session" },
   { kind = "field-set", path = "$XDG_CONFIG_HOME/example/profile.json", format = "json", key = ["account", "user"] },
 ]
+
+# Run a command to check the login status.
+[[entries]]
+id = "codex-login"
+label = "Codex sign-in"
+kind = "login"
+commands = [["codex", "login"]]
+ready_when = [
+  { kind = "command", command = ["codex", "login", "status"] },
+]
 ```
 
 ## Fields and login checks
@@ -110,4 +120,12 @@ ready_when = [
 - A login entry requires `commands`, even for one step: `commands = [["example", "login"]]`. Each step starts with an executable. SecSetter passes the remaining arguments literally and does not interpret shell syntax. Steps run in order and stop at the first failure or interruption.
 - If `ready_when` is absent or empty (`[]`), SecSetter shows no login status. If all checks pass, SecSetter shows **Login configured**. If any required file or value is absent, SecSetter shows **Login needed**. If SecSetter cannot complete a check and none fail, it shows **Unknown**.
 - A `file-exists` check accepts an empty regular file. A `field-set` check requires a non-empty string.
-- Readiness checks describe local files. They do not verify credentials. A login action can run regardless of its status.
+- File checks describe local files. A command check reports the status that the command returns. A login action can run regardless of its status.
+
+### Command checks
+
+Use a noninteractive status command from a config you trust. Put the executable first and each argument in its own string. If the check needs shell syntax, specify a shell, such as `sh -c`, in the array.
+
+SecSetter passes the arguments as written. It disconnects standard input and discards standard output and standard error. Exit `0` passes the check. A nonzero exit shows **Login needed**. If the command cannot start, ends by signal, or takes more than five seconds, the result is **Unknown** unless another check fails.
+
+`secsetter list` runs the checks each time. The terminal UI caches the status from startup and refreshes it after a login attempt for that entry. `secsetter validate` validates the array without running the command.

@@ -1,3 +1,4 @@
+mod readiness;
 mod screen;
 mod view;
 
@@ -12,6 +13,7 @@ use crossterm::event::{
 use crate::app::{Action, App, CopyDestination, Status, copy_destination};
 use crate::config::{Entry, Kind};
 use crate::login;
+use readiness::Readiness;
 use screen::{MouseCapture, Screen};
 use view::{Panel, View};
 
@@ -98,11 +100,14 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
     let mut confirm: Option<Confirmation> = None;
     let mut notice = String::new();
     let mut browser = Browser::default();
+    let mut readiness = Readiness::start(app)?;
     loop {
+        let checking = readiness.collect();
         let view = View {
             app,
             rows: &rows,
             selected,
+            readiness: &readiness,
         };
         let panel = match &confirm {
             Some(confirm) => Panel::Confirm {
@@ -112,7 +117,7 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
             None => Panel::Notice(&notice),
         };
         let (usable, _) = screen.draw(|frame| view.render(frame, panel))?;
-        let Some(Event::Key(key)) = browser.read_event(&mut notice)? else {
+        let Some(Event::Key(key)) = browser.read_event(&mut notice, checking)? else {
             continue;
         };
         if key.kind == KeyEventKind::Release
@@ -252,6 +257,7 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
                                 |failure| failure.terminal_summary(),
                                 |_| "Login completed".into(),
                             );
+                            readiness.refresh(entry)?;
                         }
                     }
                 }
@@ -277,7 +283,7 @@ fn perform(
 
 fn prompt_secret(
     screen: &mut Screen,
-    view: &View<'_>,
+    view: &View<'_, '_>,
     browser: &mut Browser,
 ) -> io::Result<Option<String>> {
     let url = view.selected_entry().and_then(|entry| entry.url.as_deref());
@@ -307,7 +313,7 @@ fn prompt_secret(
                 },
             )
         })?;
-        match browser.read_event(&mut notice)? {
+        match browser.read_event(&mut notice, false)? {
             Some(Event::Paste(text)) if usable => secret.push_str(&text),
             Some(Event::Mouse(mouse))
                 if mouse.kind == MouseEventKind::Down(MouseButton::Left)
@@ -385,7 +391,7 @@ impl Browser {
         }
     }
 
-    fn read_event(&mut self, notice: &mut String) -> io::Result<Option<Event>> {
+    fn read_event(&mut self, notice: &mut String, refresh: bool) -> io::Result<Option<Event>> {
         loop {
             let mut failed = false;
             self.openers.retain_mut(|child| {
@@ -403,8 +409,11 @@ impl Browser {
                 return Ok(None);
             }
             // Some Linux openers stay alive for the browser's lifetime.
-            if self.openers.is_empty() || event::poll(Duration::from_millis(100))? {
+            if (self.openers.is_empty() && !refresh) || event::poll(Duration::from_millis(100))? {
                 return event::read().map(Some);
+            }
+            if refresh {
+                return Ok(None);
             }
         }
     }

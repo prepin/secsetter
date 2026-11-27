@@ -63,7 +63,7 @@ pub(crate) enum Kind {
     },
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub(crate) enum LoginCheck {
     FileExists {
@@ -73,6 +73,9 @@ pub(crate) enum LoginCheck {
         path: PathBuf,
         format: Format,
         key: Vec<String>,
+    },
+    Command {
+        command: Vec<String>,
     },
 }
 
@@ -98,6 +101,19 @@ impl Entry {
         self.platforms
             .as_ref()
             .is_none_or(|platforms| platforms.contains(&current))
+    }
+
+    pub fn command_readiness(&self) -> Option<&[LoginCheck]> {
+        match &self.kind {
+            Kind::Login { ready_when, .. }
+                if ready_when
+                    .iter()
+                    .any(|check| matches!(check, LoginCheck::Command { .. })) =>
+            {
+                Some(ready_when)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -216,17 +232,8 @@ impl Config {
                         return Err(invalid("commands must contain at least one step"));
                     }
                     for (index, command) in commands.iter().enumerate() {
-                        let step = index + 1;
-                        if command.first().is_none_or(String::is_empty) {
-                            return Err(invalid(&format!(
-                                "step {step} must start with an executable"
-                            )));
-                        }
-                        if command.iter().any(|argument| argument.contains('\0')) {
-                            return Err(invalid(&format!(
-                                "step {step} must not contain NUL characters"
-                            )));
-                        }
+                        validate_command(command)
+                            .map_err(|reason| invalid(&format!("step {} {reason}", index + 1)))?;
                     }
                     for (index, check) in ready_when.iter_mut().enumerate() {
                         let invalid_check = |reason: &str| {
@@ -237,6 +244,12 @@ impl Config {
                             LoginCheck::FieldSet { path, key, .. } => {
                                 validate_key(key).map_err(invalid_check)?;
                                 path
+                            }
+                            LoginCheck::Command { command } => {
+                                validate_command(command).map_err(|reason| {
+                                    invalid_check(&format!("command {reason}"))
+                                })?;
+                                continue;
                             }
                         };
                         *path = expand_path(path).map_err(|reason| invalid_check(&reason))?;
@@ -264,6 +277,16 @@ impl Config {
             entries,
         })
     }
+}
+
+fn validate_command(command: &[String]) -> Result<(), &'static str> {
+    if command.first().is_none_or(String::is_empty) {
+        return Err("must start with an executable");
+    }
+    if command.iter().any(|argument| argument.contains('\0')) {
+        return Err("must not contain NUL characters");
+    }
+    Ok(())
 }
 
 fn valid_token_url(text: &str) -> bool {

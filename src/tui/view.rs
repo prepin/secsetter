@@ -12,7 +12,7 @@ use crate::app::{App, Status};
 use crate::config::{Entry, Kind};
 use crate::paths::PathError;
 
-use super::Row;
+use super::{Readiness, Row};
 
 const ACCENT: Color = Color::Cyan;
 const STATUS_WIDTH: usize = 15;
@@ -32,13 +32,14 @@ pub(super) enum Panel<'a> {
     },
 }
 
-pub(super) struct View<'a> {
+pub(super) struct View<'a, 'r> {
     pub app: &'a App,
     pub rows: &'a [Row<'a>],
     pub selected: usize,
+    pub readiness: &'r Readiness<'a>,
 }
 
-impl<'a> View<'a> {
+impl<'a> View<'a, '_> {
     pub fn selected_entry(&self) -> Option<&'a Entry> {
         self.rows.get(self.selected).and_then(Row::entry)
     }
@@ -96,11 +97,15 @@ impl<'a> View<'a> {
                 height,
             )
         });
-        let status = entry.map(|entry| self.app.status(entry));
+        let cached = entry.and_then(|entry| self.readiness.status(entry));
+        let live = entry
+            .filter(|_| cached.is_none())
+            .map(|entry| self.app.status(entry));
+        let status = cached.or(live.as_ref());
         let compact_reason = if wide {
             None
         } else {
-            status.as_ref().and_then(compact_reason)
+            status.and_then(compact_reason)
         };
         let message_rows = match panel {
             Panel::Secret { .. } | Panel::Confirm { .. } => 0,
@@ -126,13 +131,13 @@ impl<'a> View<'a> {
                 .spacing(1)
                 .areas(body);
             let list = pane(frame, list, " Entries ");
-            self.list(frame, list, status.as_ref(), popup);
+            self.list(frame, list, status, popup);
             let details = pane(frame, details, " Selected entry ");
-            if let (Some(entry), Some(status)) = (entry, &status) {
+            if let (Some(entry), Some(status)) = (entry, status) {
                 render_details(frame, details, entry, status);
             }
         } else {
-            self.list(frame, body, status.as_ref(), popup);
+            self.list(frame, body, status, popup);
         }
 
         if let Panel::Notice(notice) = panel {
@@ -170,7 +175,7 @@ impl<'a> View<'a> {
                 Panel::Secret { counts, notice } => {
                     return (
                         true,
-                        render_secret(frame, popup, entry, &status, counts, notice),
+                        render_secret(frame, popup, entry, status, counts, notice),
                     );
                 }
                 Panel::Notice(_) => unreachable!(),
@@ -206,7 +211,10 @@ impl<'a> View<'a> {
                 }
                 Row::Entry(entry) => {
                     let selected = first + offset == self.selected;
-                    let badge = match selected_status.filter(|_| selected) {
+                    let badge = match selected_status
+                        .filter(|_| selected)
+                        .or_else(|| self.readiness.status(entry))
+                    {
                         Some(status) => badge(status),
                         None => badge(&self.app.status(entry)),
                     };
@@ -238,7 +246,8 @@ fn badge(status: &Status) -> (&'static str, Color) {
         Status::LoginConfigured => ("✓ Login configured", Color::Green),
         Status::LoginNeeded => ("○ Login needed", Color::Yellow),
         Status::Blocked(_) => ("! Blocked", Color::Red),
-        Status::Unknown(_) => ("? Unknown", Color::Yellow),
+        Status::Unknown(_) | Status::CheckError(_) => ("? Unknown", Color::Yellow),
+        Status::Checking => ("… Checking", Color::Yellow),
         Status::Untracked => ("→", ACCENT),
     }
 }
@@ -291,7 +300,8 @@ fn render_details(frame: &mut Frame, area: Rect, entry: &Entry, status: &Status)
         Kind::Login { .. } => (None, "Enter to run login steps"),
     };
     let error = match status {
-        Status::Blocked(error) | Status::Unknown(error) => Some(error),
+        Status::Blocked(error) | Status::Unknown(error) => Some(error.to_string()),
+        Status::CheckError(error) => Some(error.clone()),
         _ => None,
     };
     let action = match status {
@@ -321,7 +331,7 @@ fn render_details(frame: &mut Frame, area: Rect, entry: &Entry, status: &Status)
     );
     let destination_area = if let Some(error) = error {
         let [destination_area, reason] = Layout::vertical([Fill(1), Fill(1)]).areas(body);
-        render_detail(frame, reason, "Reason", error.to_string());
+        render_detail(frame, reason, "Reason", error);
         destination_area
     } else {
         body
@@ -350,6 +360,7 @@ fn render_detail(frame: &mut Frame, area: Rect, heading: &'static str, value: St
 fn compact_reason(status: &Status) -> Option<Cow<'_, str>> {
     let error = match status {
         Status::Blocked(error) | Status::Unknown(error) => error,
+        Status::CheckError(error) => return Some(Cow::Borrowed(error)),
         _ => return None,
     };
     match error {

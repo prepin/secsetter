@@ -124,6 +124,11 @@ fn rejects_invalid_login_checks_at_config_load() {
         r#"{ kind = "file-exists", path = "relative/profile" }"#,
         r#"{ kind = "field-set", path = "~/profile", format = "toml", key = [] }"#,
         r#"{ kind = "field-set", path = "~/profile", format = "toml" }"#,
+        r#"{ kind = "command" }"#,
+        r#"{ kind = "command", command = "codex login status" }"#,
+        r#"{ kind = "command", command = [] }"#,
+        r#"{ kind = "command", command = [""] }"#,
+        r#"{ kind = "command", command = ["sh", "\u0000"] }"#,
     ] {
         let config = ConfigDir::new(&format!("{LOGIN}\nready_when = [{check}]"));
         let output = config.command().arg("list").output().unwrap();
@@ -131,6 +136,108 @@ fn rejects_invalid_login_checks_at_config_load() {
         assert!(output.stdout.is_empty());
         assert!(String::from_utf8_lossy(&output.stderr).contains("invalid"));
     }
+}
+
+#[test]
+fn list_uses_command_exit_status_and_validate_never_runs_the_check() {
+    let config = ConfigDir::new(&format!(
+        r#"{LOGIN}
+ready_when = [
+  {{ kind = "command", command = ["/bin/sh", "-c", '''
+    if IFS= read -r unexpected; then exit 90; fi
+    printf '%s\n' "$1" >> "$XDG_CONFIG_HOME/check-runs"
+    printf 'discard stdout'
+    printf 'discard stderr' >&2
+    test -f "$XDG_CONFIG_HOME/signed-in"
+  ''', "check", "$HOME; exit 0"] }},
+  {{ kind = "file-exists", path = "$XDG_CONFIG_HOME/profile" }},
+]
+"#
+    ));
+    let root = config.0.path();
+    let log = root.join("check-runs");
+    let input = root.join("stdin");
+    fs::write(&input, "must not reach the probe\n").unwrap();
+    let validate = config.command().arg("validate").output().unwrap();
+    assert!(validate.status.success(), "{validate:?}");
+    assert!(!log.exists());
+
+    let list = || {
+        let output = config
+            .command()
+            .arg("list")
+            .stdin(File::open(&input).unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && output.stderr.is_empty(),
+            "{output:?}"
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let needed = "demo\tSynthetic sign-in\tLogin needed\n";
+    assert_eq!(list(), needed);
+    fs::write(root.join("signed-in"), "").unwrap();
+    assert_eq!(list(), needed);
+    fs::write(root.join("profile"), "").unwrap();
+    assert_eq!(list(), "demo\tSynthetic sign-in\tLogin configured\n");
+    assert_eq!(
+        fs::read_to_string(log).unwrap(),
+        "$HOME; exit 0\n".repeat(3)
+    );
+}
+
+#[test]
+fn unavailable_command_checks_show_unknown_unless_another_check_fails() {
+    for (command, reason) in [
+        (
+            r#"["./missing-readiness-command"]"#,
+            "ready_when command 1:",
+        ),
+        (r#"["/bin/sh", "-c", "kill -TERM $$"]"#, "signal:"),
+    ] {
+        let config = ConfigDir::new(&format!(
+            r#"{LOGIN}
+ready_when = [
+  {{ kind = "command", command = {command} }},
+  {{ kind = "file-exists", path = "$XDG_CONFIG_HOME/profile" }},
+]
+"#
+        ));
+        let profile = config.0.path().join("profile");
+        fs::write(&profile, "").unwrap();
+        let output = config.command().arg("list").output().unwrap();
+        assert!(
+            output.status.success() && output.stderr.is_empty(),
+            "{output:?}"
+        );
+        let status = String::from_utf8(output.stdout).unwrap();
+        assert!(status.starts_with("demo\tSynthetic sign-in\tUnknown:") && status.contains(reason));
+
+        fs::remove_file(profile).unwrap();
+        let output = config.command().arg("list").output().unwrap();
+        assert_eq!(output.stdout, b"demo\tSynthetic sign-in\tLogin needed\n");
+    }
+}
+
+#[test]
+fn list_times_out_slow_command_checks() {
+    let config = ConfigDir::new(&format!(
+        r#"{LOGIN}
+ready_when = [{{ kind = "command", command = ["/bin/sh", "-c", "sleep 15 & wait"] }}]
+"#
+    ));
+    let start = Instant::now();
+    let output = config.command().arg("list").output().unwrap();
+    assert!(start.elapsed() < Duration::from_secs(12));
+    assert!(
+        output.status.success() && output.stderr.is_empty(),
+        "{output:?}"
+    );
+    assert_eq!(
+        output.stdout,
+        b"demo\tSynthetic sign-in\tUnknown: ready_when command 1: timed out after 5 seconds\n"
+    );
 }
 
 #[test]
@@ -375,6 +482,41 @@ ready_when = [{{ kind = "file-exists", path = "$XDG_CONFIG_HOME/ready-marker" }}
     assert!(result.contains("\x1b[?2004h"));
     assert!(result.contains("\x1b[?1049h") && result.contains("Synthetic sign-in"));
     pty.quit();
+}
+
+#[test]
+fn tui_runs_command_checks_in_background_and_refreshes_after_login() {
+    let entry = LOGIN.split_once("commands =").unwrap().0;
+    let config = ConfigDir::new(&format!(
+        r#"{entry}commands = [["/bin/sh", "-c", ': > "$XDG_CONFIG_HOME/signed-in"']]
+ready_when = [
+  {{ kind = "command", command = ["/bin/sh", "-c", '''
+    printf 'check\n' >> "$XDG_CONFIG_HOME/check-runs"
+    while [ ! -f "$XDG_CONFIG_HOME/proceed" ]; do sleep 1; done
+    test -f "$XDG_CONFIG_HOME/signed-in"
+  '''] }},
+]
+{TEMPLATE}
+"#
+    ));
+    let root = config.0.path();
+    let mut pty = Terminal::launch(config.command());
+    pty.expect("Checking");
+    pty.send(b"j");
+    pty.expect("› Synthetic sign-in");
+    fs::write(root.join("proceed"), "").unwrap();
+    pty.expect("eeded");
+    pty.send(b"k");
+    pty.expect("› Example config");
+    pty.send(b"j");
+    pty.expect("› Synthetic sign-in");
+    pty.send(b"\r");
+    pty.expect("configured");
+    pty.quit();
+    assert_eq!(
+        fs::read_to_string(root.join("check-runs")).unwrap(),
+        "check\ncheck\n"
+    );
 }
 
 #[test]

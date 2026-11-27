@@ -47,10 +47,28 @@ fn run() -> Result<ExitCode, String> {
         }
         [command] if command == "list" => {
             let app = App::load(config_path)?;
+            let interrupt = app
+                .entries()
+                .any(|entry| entry.command_readiness().is_some())
+                .then(login::InterruptGuard::new)
+                .transpose()
+                .map_err(|error| format!("list: {error}"))?;
+            let interrupted = || {
+                interrupt
+                    .as_ref()
+                    .is_some_and(login::InterruptGuard::interrupted)
+            };
             for entry in app.entries() {
                 let id = entry.id.escape_debug();
                 let label = entry.label.escape_debug();
-                match app.status(entry) {
+                let status = match entry.command_readiness() {
+                    Some(checks) => app::login_status(checks, interrupted),
+                    None => app.status(entry),
+                };
+                if interrupted() {
+                    return Ok(ExitCode::from(130));
+                }
+                match status {
                     Status::Untracked => println!("{id}\t{label}"),
                     status => println!("{id}\t{label}\t{status}"),
                 }
