@@ -464,6 +464,7 @@ url = "{url}"
     tui.read_through("******");
     tui.send(b"\x1b[<0;1;1M\x1b[<0;66;9M");
     tui.read_through("Could not open token page");
+    tui.read_through("exit status: 7");
     assert_eq!(
         fs::read_to_string(&opened).unwrap(),
         format!("{url}\n").repeat(2)
@@ -471,6 +472,7 @@ url = "{url}"
 
     tui.send(b"\x0f");
     tui.read_through("Could not open token page");
+    tui.read_through("exit status: 7");
     assert_eq!(
         fs::read_to_string(&opened).unwrap(),
         format!("{url}\n").repeat(3)
