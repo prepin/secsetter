@@ -4,7 +4,7 @@ use rustix::process::{Gid, Uid};
 use serde::{Deserialize, Serialize};
 
 use crate::paths::{Location, PathError, WriteInterrupts};
-use crate::secret_field::{Format, validate_key};
+use crate::secret_field::Format;
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
@@ -36,8 +36,10 @@ impl FileWrite {
             Self::Remove if !bytes.is_empty() => return Err("unexpected input for removal".into()),
             _ => {}
         }
-        if let Self::Field { key, .. } = self {
-            validate_key(key).map_err(|error| format!("{path:?}: {error}"))?;
+        if let Self::Field { format, key } = self {
+            format
+                .validate_key(key)
+                .map_err(|error| format!("{path:?}: {error}"))?;
         }
         let _interrupts =
             WriteInterrupts::start().map_err(|error| format!("set up interruption: {error}"))?;

@@ -1,4 +1,5 @@
 mod json;
+mod netrc;
 mod toml;
 mod yaml;
 
@@ -14,15 +15,9 @@ use crate::paths::{Location, PathError};
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Format {
     Json,
+    Netrc,
     Toml,
     Yaml,
-}
-
-pub(crate) fn validate_key(key: &[String]) -> Result<(), &'static str> {
-    if key.is_empty() {
-        return Err("key must contain at least one name");
-    }
-    Ok(())
 }
 
 enum EditError {
@@ -31,6 +26,16 @@ enum EditError {
 }
 
 impl Format {
+    pub fn validate_key(self, key: &[String]) -> Result<(), &'static str> {
+        if matches!(self, Self::Netrc) {
+            return netrc::validate_key(key);
+        }
+        if key.is_empty() {
+            return Err("key must contain at least one name");
+        }
+        Ok(())
+    }
+
     pub fn is_set(self, destination: &Path, key: &[String]) -> Result<bool, PathError> {
         let mut file = Location::destination(destination, false)?.open_regular()?;
         let document = read_document(&mut file, destination)?;
@@ -41,6 +46,7 @@ impl Format {
     fn document_is_set(self, document: String, key: &[String]) -> Result<bool, &'static str> {
         match self {
             Self::Json => json::is_set(document, key),
+            Self::Netrc => netrc::is_set(&document, &key[0]),
             Self::Toml => toml::is_set(document, key),
             Self::Yaml => yaml::is_set(document, key),
         }
@@ -63,7 +69,8 @@ impl Format {
             Err(error) => return Err(file_error(error)),
         };
         let document = read_document(&mut file, destination).map_err(file_error)?;
-        if value.is_empty()
+        if !matches!(self, Self::Netrc)
+            && value.is_empty()
             && !self
                 .document_is_set(document.clone(), key)
                 .map_err(|reason| file_error(PathError::Blocked(destination.to_owned(), reason)))?
@@ -71,9 +78,10 @@ impl Format {
             return Ok(());
         }
         let edited = match self {
-            Self::Json => json::edit(document, key, value),
-            Self::Toml => toml::edit(document, key, value),
-            Self::Yaml => yaml::edit(document, key, value),
+            Self::Json => json::edit(document, key, value).map(Some),
+            Self::Netrc => netrc::edit(document, &key[0], value),
+            Self::Toml => toml::edit(document, key, value).map(Some),
+            Self::Yaml => yaml::edit(document, key, value).map(Some),
         }
         .map_err(|error| match error {
             EditError::Blocked(reason) => {
@@ -89,9 +97,12 @@ impl Format {
                 )
             }
         })?;
-        locked
-            .replace_file(&file, edited.as_bytes())
-            .map_err(file_error)
+        if let Some(edited) = edited {
+            locked
+                .replace_file(&file, edited.as_bytes())
+                .map_err(file_error)?;
+        }
+        Ok(())
     }
 }
 

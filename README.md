@@ -12,7 +12,7 @@ SecSetter gives you one terminal screen for the setup steps that still need you:
 - **Restore a private config.** Fetch a backed-up file from [fnox](https://fnox.jdx.dev/) and write it where the application expects it.
 - **Repeat the same setup across machines.** Keep the SecSetter TOML config and non-secret templates in your dotfiles. Put real secrets in the application files or your secret store.
 
-SecSetter can write a whole secret file or update one string field in TOML, YAML, or JSON. Login actions run commands in order. Optional readiness checks can inspect local files, command exit codes, or JSON output.
+SecSetter can write a whole secret file, update one field in TOML, YAML, or JSON, or set one machine's password in `.netrc`. Login actions run commands in order. Optional readiness checks can inspect local files, command exit codes, or JSON output.
 
 ## Install
 
@@ -70,7 +70,7 @@ Each `[[entries]]` table needs a unique, non-empty `id`, a `label`, and a `kind`
 | `kind` | Required fields | Action |
 | --- | --- | --- |
 | `template` | `source`, `destination` | Install a non-secret file. The `source` path is relative to `templates/` beside the selected config. |
-| `secret-field` | `destination`, `format`, `key` | Set a string field in an existing TOML, YAML, or JSON file. |
+| `secret-field` | `destination`, `format`, `key` | Set a string field in TOML, YAML, or JSON, or a password in `.netrc`. |
 | `secret-file` | `destination` | Write a whole file from secret input. |
 | `fnox-file` | `source`, `destination` | Restore a whole file from fnox. The `source` is a literal fnox key. The restore requires `fnox` on `PATH`. |
 | `login` | `commands` | Run login steps in the current terminal. Add `ready_when` to show a login status. |
@@ -83,7 +83,31 @@ Each `[[entries]]` table needs a unique, non-empty `id`, a `label`, and a `kind`
 | `privileged`, `owner`, `group` | File entries | If a file operation needs elevation, set `privileged = true`. Supply the Unix user and group names in `owner` and `group`. |
 | `ready_when` | `login` | Run the optional readiness checks described below. |
 
-Use an absolute path or start with `~/` or `$XDG_CONFIG_HOME/` for a `destination` or a file check's `path`. The `-c` option does not change how these prefixes expand. For a `secret-field` or `field-set` check, use `format = "toml"`, `"yaml"`, or `"json"`. Write `key` as an array such as `["credentials", "token"]`. A dot inside a key is literal. Key paths cannot traverse arrays. For a `secret-field` write, the file and all parent objects must exist.
+Use an absolute path or start with `~/` or `$XDG_CONFIG_HOME/` for a `destination` or a file check's `path`. The `-c` option does not change how these prefixes expand. A `secret-field` or `field-set` check supports `format = "toml"`, `"yaml"`, `"json"`, or `"netrc"`. For TOML, YAML, and JSON, write `key` as an array such as `["credentials", "token"]`. A dot inside a key is literal. Key paths cannot traverse arrays. For a `secret-field` write, the file and all parent objects must exist.
+
+### Set a `.netrc` password
+
+```toml
+[[entries]]
+id = "gitlab-netrc-token"
+label = "GitLab token in .netrc"
+kind = "secret-field"
+destination = "~/.netrc"
+format = "netrc"
+key = ["gitlab.example.com", "password"]
+```
+
+Create the machine entry first, with its `login` but without a `password` field:
+
+```netrc
+machine gitlab.example.com
+  login oauth2
+
+machine git.example.com
+  login user
+```
+
+SecSetter adds or replaces the selected machine's password. Clearing the secret removes the password field and keeps the machine and its login. Use a separate `secret-field` entry for each hostname. Use a single unquoted token with no trailing newline. See the [`.netrc` guide](skills/secsetter/SKILL.md#netrc-passwords) for the supported syntax.
 
 ### Sections
 

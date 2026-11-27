@@ -67,6 +67,15 @@ format = "toml"
 key = ["credentials", "token"]
 url = "https://example.com/settings/tokens"
 
+# Set one machine's password in an existing .netrc file.
+[[entries]]
+id = "netrc-token"
+label = "GitLab token in .netrc"
+kind = "secret-field"
+destination = "~/.netrc"
+format = "netrc"
+key = ["gitlab.example.com", "password"]
+
 # Write a secret as an entire file.
 [[entries]]
 id = "token-file"
@@ -136,11 +145,31 @@ ready_when = [
 
 ## Fields and login checks
 
-- For `secret-field` and `field-set`, choose `format = "toml"`, `"yaml"`, or `"json"`. List each key as a separate string. A dot within a key is literal. Key paths cannot traverse arrays. To set a field, the file and all parent objects must exist.
+- `secret-field` and `field-set` support `format = "toml"`, `"yaml"`, `"json"`, or `"netrc"`. For TOML, YAML, and JSON, list each key as a separate string. A dot within a key is literal. Key paths cannot traverse arrays. To set a field, the file and all parent objects must exist.
 - A login entry requires `commands`, even for one step: `commands = [["example", "login"]]`. Each step starts with an executable. SecSetter passes the remaining arguments literally and does not interpret shell syntax. Steps run in order and stop at the first failure or interruption.
 - If all checks pass, SecSetter shows **Login configured**. If a check fails, it shows **Login needed**. If a check cannot determine the status and none fail, the status is **Unknown**. The terminal UI shows `¯\_(ツ)_/¯` for unknown status or when `ready_when` is absent or empty (`[]`). `secsetter list` uses **Unknown** for an unknown status and omits the status column when there are no checks.
 - A `file-exists` check accepts an empty regular file. A `field-set` check requires a non-empty string.
 - File checks describe local files. A command check reports the status that the command returns. A login action can run regardless of its status.
+
+### `.netrc` passwords
+
+Use `format = "netrc"` with `key = ["hostname", "password"]`. SecSetter matches the machine name without regard to ASCII case. The destination file and the machine entry must exist before you set a password.
+
+For a template, leave out the `password` field until you have a token:
+
+```netrc
+machine gitlab.example.com
+  login oauth2
+
+machine git.example.com
+  login user
+```
+
+A bare `password` keyword has no value. A client can read the next keyword as its value. A non-empty placeholder is a password value, so SecSetter reports it as **Set**.
+
+Paste one unquoted token. For CLI use, pass the token on standard input without a trailing newline. SecSetter rejects whitespace, double quotes, backslashes, control characters, a leading `#`, and reserved `.netrc` keywords in new passwords.
+
+`clear` removes the password field and keeps the machine and its login. A `field-set` check can use the same selector. It checks for a non-empty password in that machine entry and ignores `default` credentials. SecSetter preserves other machines and full-line comments. It blocks ambiguous entries and files that contain inline comments or `macdef` macros.
 
 ### Command checks
 

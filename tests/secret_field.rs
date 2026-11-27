@@ -18,6 +18,14 @@ impl Fixture {
     }
 
     fn with_format(format: &str, extension: &str) -> Self {
+        Self::with_key(
+            format,
+            extension,
+            r#"["hosts", "gitlab.example.com", "token"]"#,
+        )
+    }
+
+    fn with_key(format: &str, extension: &str, key: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let destination = format!("glab/config.{extension}");
@@ -32,7 +40,7 @@ label = "GitLab token"
 kind = "secret-field"
 destination = "$XDG_CONFIG_HOME/{destination}"
 format = "{format}"
-key = ["hosts", "gitlab.example.com", "token"]
+key = {key}
 "#,
             ),
         )
@@ -92,6 +100,190 @@ fn failure(output: Output, reason: &str) -> String {
     assert!(error.contains(reason), "{error}");
     assert!(!error.contains("secret-value"), "{error}");
     error
+}
+
+#[test]
+fn netrc_sets_and_clears_only_the_selected_machine_password() {
+    let fixture = Fixture::with_key("netrc", "netrc", r#"["gitlab.example.com", "password"]"#);
+    let path = fixture.destination();
+    let clear = || fixture.command().args(["clear", "token"]).output().unwrap();
+    assert_eq!(success(clear()), "Cleared\n");
+    assert!(!path.parent().unwrap().exists());
+    fs::create_dir(path.parent().unwrap()).unwrap();
+    let original = concat!(
+        "# First host\r\n",
+        "machine GitLab.Example.Com\r\n",
+        "  login oauth2\r\n",
+        "\r\n",
+        "# Keep the second host and the default intact\r\n",
+        "machine git.example.com login demo password \"other secret\"\r\n",
+        "default login fallback account extra"
+    );
+    fs::write(&path, original).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let list = || fixture.list();
+    assert_eq!(list(), "token\tGitLab token\tNot set\n");
+    assert_eq!(success(fixture.set(b"synthetic-token")), "Set\n");
+    assert_eq!(list(), "token\tGitLab token\tSet\n");
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        original.replace("login oauth2", "login oauth2 password synthetic-token")
+    );
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(success(clear()), "Cleared\n");
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+    for old in [r#""quoted \"secret\"""#, r#""""#] {
+        let password_line = format!("  password {old}\r\n");
+        let with_password = original.replace("\r\n\r\n", &format!("\r\n{password_line}\r\n"));
+        fs::write(&path, &with_password).unwrap();
+        let status = if old == "\"\"" { "Not set" } else { "Set" };
+        assert_eq!(list(), format!("token\tGitLab token\t{status}\n"));
+        assert_eq!(success(fixture.set(b"replacement")), "Set\n");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            with_password.replace(&password_line, "  password replacement\r\n")
+        );
+        assert_eq!(success(clear()), "Cleared\n");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+}
+
+#[test]
+fn netrc_rejects_ambiguous_files_and_unsafe_passwords_without_changing_the_file() {
+    let fixture = Fixture::with_key("netrc", "netrc", r#"["gitlab.example.com", "password"]"#);
+    let path = fixture.destination();
+    fs::create_dir(path.parent().unwrap()).unwrap();
+    for (original, reason) in [
+        (
+            "machine gitlab.example.com login oauth2 password\nmachine git.example.com login demo",
+            "missing .netrc field value",
+        ),
+        (
+            "machine gitlab.example.com login oauth2\nmachine GITLAB.EXAMPLE.COM login demo",
+            "duplicate .netrc machine",
+        ),
+        (
+            "machine gitlab.example.com password secret-value password second",
+            "duplicate .netrc field",
+        ),
+        (
+            "machine gitlab.example.com password \"secret-value\n",
+            "invalid or unsupported .netrc syntax",
+        ),
+        (
+            "machine gitlab.example.com login demo\nmacdef init\n\n",
+            ".netrc macros are not supported",
+        ),
+        (
+            "machine gitlab.example.com login demo # machine other password secret-value\n",
+            "only full-line .netrc comments are supported",
+        ),
+    ] {
+        fs::write(&path, original).unwrap();
+        let status = fixture.list();
+        assert!(status.contains("Blocked:") && status.contains(reason));
+        assert!(!status.contains("secret-value"));
+        failure(fixture.set(b"replacement"), reason);
+        failure(
+            fixture.command().args(["clear", "token"]).output().unwrap(),
+            reason,
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    let original = "machine gitlab.example.com login oauth2 password secret-value";
+    fs::write(&path, original).unwrap();
+    for input in [
+        b"secret-value\n".as_slice(),
+        b"secret-value other",
+        b"secret-value\0",
+        b"\"secret-value\"",
+        b"#secret-value",
+        b"secret-value\\",
+        b"machine",
+    ] {
+        failure(
+            fixture.set(input),
+            "netrc passwords must be single unquoted tokens",
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    let other_host = "machine git.example.com login demo password secret-value\n";
+    fs::write(&path, other_host).unwrap();
+    assert_eq!(fixture.list(), "token\tGitLab token\tNot set\n");
+    failure(
+        fixture.set(b"replacement"),
+        "selected .netrc machine does not exist",
+    );
+    assert_eq!(
+        success(fixture.command().args(["clear", "token"]).output().unwrap()),
+        "Cleared\n"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), other_host);
+}
+
+#[test]
+fn netrc_field_checks_use_the_same_machine_and_password_selector() {
+    let fixture = Fixture::with_key("netrc", "netrc", r#"["gitlab.example.com", "password"]"#);
+    let path = fixture.destination();
+    fs::create_dir(path.parent().unwrap()).unwrap();
+    fs::write(&path, "machine gitlab.example.com login oauth2\n").unwrap();
+    let config_path = fixture.root.join("secsetter/config.toml");
+    writeln!(
+        OpenOptions::new().append(true).open(&config_path).unwrap(),
+        r#"
+[[entries]]
+id = "login"
+label = "GitLab login"
+kind = "login"
+commands = [["true"]]
+ready_when = [
+  {{ kind = "field-set", path = "$XDG_CONFIG_HOME/glab/config.netrc", format = "netrc", key = ["gitlab.example.com", "password"] }},
+]
+"#
+    ).unwrap();
+    assert!(
+        fixture
+            .list()
+            .contains("login\tGitLab login\tLogin needed\n")
+    );
+    assert_eq!(success(fixture.set(b"synthetic-token")), "Set\n");
+    assert!(
+        fixture
+            .list()
+            .contains("login\tGitLab login\tLogin configured\n")
+    );
+
+    let config = fs::read_to_string(&config_path).unwrap();
+    for key in [
+        r#"["gitlab.example.com"]"#,
+        r#"["gitlab.example.com", "login"]"#,
+        r#"["", "password"]"#,
+    ] {
+        fs::write(
+            &config_path,
+            config.replacen(r#"["gitlab.example.com", "password"]"#, key, 1),
+        )
+        .unwrap();
+        failure(
+            fixture.command().arg("validate").output().unwrap(),
+            "netrc key must be",
+        );
+    }
+    fs::write(
+        &config_path,
+        config.replace(
+            r#"key = ["gitlab.example.com", "password"] }"#,
+            r#"key = ["gitlab.example.com"] }"#,
+        ),
+    )
+    .unwrap();
+    failure(
+        fixture.command().arg("validate").output().unwrap(),
+        "ready_when check 1: netrc key must be",
+    );
 }
 
 #[test]

@@ -38,6 +38,8 @@ Config options:
   url         Link a secret-file or secret-field entry to its token page.
               Use an absolute HTTP(S) URL without credentials. Press o in the
               list, or press Ctrl+O or click Open token page in the popup.
+  format      Use toml, yaml, json, or netrc for secret-field and field-set.
+              For netrc, use key = [\"hostname\", \"password\"].
   commands    Set the ordered steps of a login entry as arrays of literal arguments.
   ready_when  Set optional login checks: file-exists, field-set, and command.
               Add json.matches to a command check to match JSON output.
@@ -76,11 +78,13 @@ templates/ beside the config file.
         Some("set") => (
             "set <id>",
             "Set the manual secret identified by <id>. Supply a non-empty secret on
-non-terminal standard input. An existing secret is replaced.",
+non-terminal standard input. An existing secret is replaced.
+For a netrc entry, supply one unquoted token with no trailing newline.",
         ),
         Some("clear") => (
             "clear <id>",
             "Empty the secret field or remove the local file identified by <id>.
+For a netrc entry, remove the password field and keep the machine block.
 There is no confirmation prompt. The stored fnox copy remains available.",
         ),
         Some("restore") => (

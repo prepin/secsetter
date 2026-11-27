@@ -9,7 +9,7 @@ use rustix::fs::{self, Mode, OFlags};
 use serde::Deserialize;
 
 use crate::login::JsonCheck;
-use crate::secret_field::{Format, validate_key};
+use crate::secret_field::Format;
 
 pub(crate) struct Config {
     pub directory: OwnedFd,
@@ -194,8 +194,8 @@ impl Config {
                     ));
                 }
             }
-            if let Kind::SecretField { key, .. } = &entry.kind {
-                validate_key(key).map_err(invalid)?;
+            if let Kind::SecretField { format, key, .. } = &entry.kind {
+                format.validate_key(key).map_err(invalid)?;
             }
             let destination = match &mut entry.kind {
                 Kind::Template {
@@ -243,8 +243,8 @@ impl Config {
                         };
                         let path = match check {
                             LoginCheck::FileExists { path } => path,
-                            LoginCheck::FieldSet { path, key, .. } => {
-                                validate_key(key).map_err(invalid_check)?;
+                            LoginCheck::FieldSet { path, format, key } => {
+                                format.validate_key(key).map_err(invalid_check)?;
                                 path
                             }
                             LoginCheck::Command { command, json } => {
