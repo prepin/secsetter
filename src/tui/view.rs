@@ -195,6 +195,15 @@ impl<'a> View<'a, '_> {
             frame.render_widget("No entries for this platform".dim(), area);
             return;
         }
+        let has_login_status = self.rows.iter().filter_map(Row::entry).any(
+            |entry| matches!(&entry.kind, Kind::Login { ready_when, .. } if !ready_when.is_empty()),
+        );
+        let status_width = if has_login_status {
+            LOGIN_STATUS_WIDTH
+        } else {
+            STATUS_WIDTH
+        };
+        let label_width = usize::from(area.width).saturating_sub(status_width + 4);
         let rows = usize::from(area.height);
         let visible_rows = popup.map_or(rows, |popup| {
             rows.min(usize::from(popup.y.saturating_sub(area.y)))
@@ -218,7 +227,7 @@ impl<'a> View<'a, '_> {
                         Some(status) => badge(status),
                         None => badge(&self.app.status(entry)),
                     };
-                    entry_line(entry, badge, area.width, selected)
+                    entry_line(entry, badge, label_width, selected)
                 }
             })
             .collect();
@@ -255,15 +264,9 @@ fn badge(status: &Status) -> (&'static str, Color) {
 fn entry_line(
     entry: &Entry,
     (badge, color): (&str, Color),
-    width: u16,
+    label_width: usize,
     selected: bool,
 ) -> Line<'static> {
-    let status_width = if matches!(entry.kind, Kind::Login { .. }) {
-        LOGIN_STATUS_WIDTH
-    } else {
-        STATUS_WIDTH
-    };
-    let label_width = usize::from(width).saturating_sub(status_width + 4);
     let label = fit(&entry.label, label_width);
     let padding = " ".repeat(label_width.saturating_sub(label.width()));
     let title = if selected {
