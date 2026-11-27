@@ -27,6 +27,7 @@ pub(crate) struct Entry {
     pub id: String,
     pub label: String,
     pub section: Option<String>,
+    pub url: Option<String>,
     platforms: Option<Vec<Platform>>,
     #[serde(default)]
     privileged: bool,
@@ -160,6 +161,21 @@ impl Config {
                     "section must be non-blank and contain no control characters",
                 ));
             }
+            if let Some(url) = &entry.url {
+                if !matches!(
+                    entry.kind,
+                    Kind::SecretFile { .. } | Kind::SecretField { .. }
+                ) {
+                    return Err(invalid(
+                        "url is only supported for secret-file and secret-field",
+                    ));
+                }
+                if !valid_token_url(url) {
+                    return Err(invalid(
+                        "url must be an absolute HTTP or HTTPS URL without credentials",
+                    ));
+                }
+            }
             if let Kind::SecretField { key, .. } = &entry.kind {
                 validate_key(key).map_err(invalid)?;
             }
@@ -248,6 +264,17 @@ impl Config {
             entries,
         })
     }
+}
+
+fn valid_token_url(text: &str) -> bool {
+    text.split_once("://").is_some_and(|(scheme, rest)| {
+        (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+            && !rest.is_empty()
+            && !rest.starts_with('/')
+            && !text.contains('\\')
+            && !text.chars().any(|c| c.is_control() || c.is_whitespace())
+    }) && url::Url::parse(text)
+        .is_ok_and(|url| url.has_host() && url.username().is_empty() && url.password().is_none())
 }
 
 fn config_home() -> Result<PathBuf, String> {

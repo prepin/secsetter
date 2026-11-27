@@ -100,7 +100,7 @@ fn parse_node(raw: &RawValue, depth: usize) -> Result<Node<'_>, &'static str> {
         })?;
         let fields = fields
             .into_iter()
-            .map(|(name, raw)| Ok((name, parse_node(raw, depth + 1)?)))
+            .map(|(name, raw)| parse_node(raw, depth + 1).map(|node| (name, node)))
             .collect::<Result<_, _>>()?;
         Ok(Node::Object(token, fields))
     } else if token.starts_with('[') {

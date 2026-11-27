@@ -17,6 +17,7 @@ serde_json = { version = "1", features = ["raw_value"] }
 toml = "1"
 toml_edit = "0.25"
 unicode-width = "0.2"
+url = "2"
 tempfile = "3"
 
 [dev-dependencies]

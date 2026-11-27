@@ -26,7 +26,10 @@ pub(super) enum Panel<'a> {
         verb: &'a str,
         cancel_selected: bool,
     },
-    Secret(&'a [usize]),
+    Secret {
+        counts: &'a [usize],
+        notice: &'a str,
+    },
 }
 
 pub(super) struct View<'a> {
@@ -40,7 +43,7 @@ impl<'a> View<'a> {
         self.rows.get(self.selected).and_then(Row::entry)
     }
 
-    pub fn render(&self, frame: &mut Frame, panel: Panel<'_>) -> bool {
+    pub fn render(&self, frame: &mut Frame, panel: Panel<'_>) -> (bool, Option<Rect>) {
         let area = frame.area();
         if area.width < 32 || area.height < 8 {
             let keys = match panel {
@@ -52,7 +55,7 @@ impl<'a> View<'a> {
                     .centered()
                     .wrap(WRAP);
             frame.render_widget(message, area);
-            return false;
+            return (false, None);
         }
 
         let wide = area.width >= 90 && area.height >= 22;
@@ -100,7 +103,7 @@ impl<'a> View<'a> {
             status.as_ref().and_then(compact_reason)
         };
         let message_rows = match panel {
-            Panel::Secret(_) | Panel::Confirm { .. } => 0,
+            Panel::Secret { .. } | Panel::Confirm { .. } => 0,
             Panel::Notice("") if compact_reason.is_none() => 0,
             _ => 2,
         };
@@ -134,7 +137,16 @@ impl<'a> View<'a> {
 
         if let Panel::Notice(notice) = panel {
             let can_clear = matches!(status, Some(Status::Set));
-            render_notice(frame, footer, notice, compact_reason, wide, can_clear);
+            let can_open = entry.is_some_and(|entry| entry.url.is_some());
+            render_notice(
+                frame,
+                footer,
+                notice,
+                compact_reason,
+                wide,
+                can_clear,
+                can_open,
+            );
         } else if let (Some(popup), Some(entry), Some(status)) = (popup, entry, status) {
             for cell in &mut frame.buffer_mut().content {
                 if cell.symbol() != " " && cell.bg != ACCENT {
@@ -155,11 +167,16 @@ impl<'a> View<'a> {
                         cancel_selected,
                     );
                 }
-                Panel::Secret(counts) => render_secret(frame, popup, entry, &status, counts),
+                Panel::Secret { counts, notice } => {
+                    return (
+                        true,
+                        render_secret(frame, popup, entry, &status, counts, notice),
+                    );
+                }
                 Panel::Notice(_) => unreachable!(),
             }
         }
-        true
+        (true, None)
     }
 
     fn list(
@@ -349,6 +366,7 @@ fn render_notice(
     reason: Option<Cow<'_, str>>,
     wide: bool,
     can_clear: bool,
+    can_open: bool,
 ) {
     let block = if wide {
         Block::bordered()
@@ -366,10 +384,14 @@ fn render_notice(
     };
     frame.render_widget(block.border_style(Style::new().fg(Color::DarkGray)), area);
     frame.render_widget(Paragraph::new(Line::from(text)).wrap(WRAP), message);
-    let keys = match (can_clear, controls.width >= 46) {
-        (true, true) => "↑/↓ move  Enter open  Del clear  Esc quit",
-        (true, false) => "↑/↓  Enter  Del clear  Esc",
-        (false, _) => "↑/↓ move  Enter open  Esc quit",
+    let keys = match (can_clear, can_open, controls.width) {
+        (true, true, 57..) => "↑/↓ move  Enter open  o token page  Del clear  Esc quit",
+        (true, true, _) => "↑/↓  Enter  o URL  Del  Esc",
+        (false, true, 46..) => "↑/↓ move  Enter open  o token page  Esc quit",
+        (false, true, _) => "↑/↓  Enter  o URL  Esc",
+        (true, false, 46..) => "↑/↓ move  Enter open  Del clear  Esc quit",
+        (true, false, _) => "↑/↓  Enter  Del clear  Esc",
+        (false, false, _) => "↑/↓ move  Enter open  Esc quit",
     };
     frame.render_widget(Line::from(keys.fg(ACCENT)), controls);
 }
@@ -473,23 +495,45 @@ fn draw_popup(frame: &mut Frame, area: Rect, title: &str) -> Rect {
     inner
 }
 
-fn render_secret(frame: &mut Frame, area: Rect, entry: &Entry, status: &Status, counts: &[usize]) {
+fn render_secret(
+    frame: &mut Frame,
+    area: Rect,
+    entry: &Entry,
+    status: &Status,
+    counts: &[usize],
+    notice: &str,
+) -> Option<Rect> {
     let title = if matches!(status, Status::Set) {
         " Replace secret "
     } else {
         " Set secret "
     };
+    let title = if notice.is_empty() {
+        title
+    } else {
+        " Could not open token page "
+    };
     let inner = draw_popup(frame, area, title);
     let expanded = area.width >= 56 && area.height >= 10;
     let width = usize::from(inner.width);
 
-    let mut description = vec![fit(&entry.label, width).bold().into()];
+    let link_text = "Open token page";
+    let link = entry.url.as_ref().map(|_| {
+        let link_width = link_text.len() as u16;
+        Rect::new(inner.right() - link_width, inner.y, link_width, 1)
+    });
+    let label_width = link.map_or(width, |link| usize::from(link.x - inner.x - 1));
+    let mut description = vec![fit(&entry.label, label_width).bold().into()];
     let mut detail_rows = 1;
     if expanded
         && let Kind::SecretFile { destination } | Kind::SecretField { destination, .. } =
             &entry.kind
     {
-        let target = format!("Destination: {}", destination.display());
+        let target = if notice.is_empty() {
+            format!("Destination: {}", destination.display())
+        } else {
+            notice.to_owned()
+        };
         let target = single_line(&target);
         detail_rows = 2 + u16::from(area.height > 10 && target.width() > width);
         description.push(target.into_owned().dim().into());
@@ -498,6 +542,9 @@ fn render_secret(frame: &mut Frame, area: Rect, entry: &Entry, status: &Status, 
         Layout::vertical([Length(detail_rows), Fill(1), Length(1)]).areas(inner);
 
     frame.render_widget(Paragraph::new(description).wrap(WRAP), details);
+    if let Some(link) = link {
+        frame.render_widget(Line::from(link_text.fg(ACCENT).underlined()), link);
+    }
 
     let field = if expanded {
         let field = Block::bordered()
@@ -520,12 +567,15 @@ fn render_secret(frame: &mut Frame, area: Rect, entry: &Entry, status: &Status, 
         ))
     };
     frame.render_widget(content, field);
-    let keys = if controls.width >= 42 {
-        "Enter submit   Esc cancel   Ctrl+J newline"
-    } else {
-        "Enter OK  Ctrl+J line  Esc"
+    let keys = match (link.is_some(), controls.width) {
+        (true, 56..) => "Enter submit   Esc cancel   Ctrl+J newline   Ctrl+O open",
+        (true, 35..) => "Enter OK  Esc  Ctrl+J line  Ctrl+O",
+        (true, _) => "Enter OK  Esc  ^J line  ^O",
+        (false, 42..) => "Enter submit   Esc cancel   Ctrl+J newline",
+        (false, _) => "Enter OK  Ctrl+J line  Esc",
     };
     frame.render_widget(Line::from(keys.fg(ACCENT)), controls);
+    link
 }
 
 fn masked_rows(counts: &[usize], width: usize, height: usize) -> Vec<Line<'static>> {

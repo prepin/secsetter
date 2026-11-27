@@ -36,6 +36,12 @@ Custom sections appear first, in alphabetical order without regard to case. Entr
 
 The TUI omits empty sections. Entries within each section keep their config order. `secsetter list` keeps the original config order.
 
+## Token pages
+
+Set `url` on a `secret-field` or `secret-file` entry to link to the page where you create or rotate its token. Use an absolute HTTP or HTTPS URL without credentials. Keep token values out of the URL.
+
+Press `o` on the selected entry to open the page in your default browser. In the secret popup, click **Open token page** or press **Ctrl+O**. The popup keeps any text you entered.
+
 ## Example config
 
 Copy the entries that match the task. Replace example IDs, paths, keys, and commands with the actual values.
@@ -64,6 +70,7 @@ id = "token-file"
 label = "Standalone token"
 kind = "secret-file"
 destination = "$XDG_CONFIG_HOME/example/token"
+url = "https://example.com/settings/tokens"
 
 # Restore an entire file from fnox.
 [[entries]]

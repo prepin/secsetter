@@ -376,6 +376,115 @@ fn cli_set_rejects_terminal_stdin() {
 }
 
 #[test]
+fn validates_token_urls_for_manual_secrets_only() {
+    for url in [
+        "file:///tmp/token",
+        "https:example.com",
+        "https:/example.com/path://more",
+        "https:///example.com",
+        "https://",
+        "https://[broken",
+        "https://user:password@example.com",
+        "https://example.com/with space",
+    ] {
+        let fixture = Fixture::new();
+        let config = fixture.root.join("secsetter/config.toml");
+        let input = fs::read_to_string(&config).unwrap();
+        fs::write(config, format!("{input}\nurl = {url:?}\n")).unwrap();
+        assert_failure(
+            fixture.command().arg("validate").output().unwrap(),
+            "url must be an absolute HTTP or HTTPS URL",
+        );
+    }
+    let fixture = Fixture::with_config(&format!(
+        "{FNOX_CONFIG}\nurl = 'https://example.com/tokens'"
+    ));
+    assert_failure(
+        fixture.command().arg("validate").output().unwrap(),
+        "url is only supported for secret-file and secret-field",
+    );
+    let field = Fixture::with_config(
+        r#"
+[[entries]]
+id = "field"
+label = "Token field"
+kind = "secret-field"
+destination = "$XDG_CONFIG_HOME/example.json"
+format = "json"
+key = ["token"]
+url = "https://example.com/tokens"
+"#,
+    );
+    assert_eq!(
+        success(field.command().arg("validate").output().unwrap()),
+        "Config is valid.\n"
+    );
+}
+
+#[test]
+fn tui_opens_token_pages_without_losing_secret_input() {
+    let url = "https://example.com/tokens?name=demo&scope=read";
+    let config = Fixture::with_config(&format!(
+        r#"
+[[entries]]
+id = "token"
+label = "Token file"
+kind = "secret-file"
+destination = "$XDG_CONFIG_HOME/secrets/token"
+url = "{url}"
+"#
+    ));
+    let opener = config.root.join(if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    });
+    fs::write(
+        &opener,
+        format!(
+            "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = '{url}' ] || exit 42\n\
+             printf '%s\\n' \"$1\" >> \"$XDG_CONFIG_HOME/opened\"\nexit 7\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(opener, fs::Permissions::from_mode(0o700)).unwrap();
+    let opened = config.root.join("opened");
+    let mut tui = config.open_tui();
+    tui.read_through("o token page");
+    assert!(!opened.exists());
+    tui.send(b"o");
+    tui.read_through("status:");
+    tui.read_through("7");
+    assert_eq!(fs::read_to_string(&opened).unwrap(), format!("{url}\n"));
+
+    tui.send(b"\r");
+    tui.read_through("\x1b[?1006h");
+    tui.read_through("Open token page");
+    tui.send(b"o\x1b[200~secret\x1b[201~");
+    tui.read_through("******");
+    tui.send(b"\x1b[<0;1;1M\x1b[<0;66;9M");
+    tui.read_through("Could not open token page");
+    assert_eq!(
+        fs::read_to_string(&opened).unwrap(),
+        format!("{url}\n").repeat(2)
+    );
+
+    tui.send(b"\x0f");
+    tui.read_through("Could not open token page");
+    assert_eq!(
+        fs::read_to_string(&opened).unwrap(),
+        format!("{url}\n").repeat(3)
+    );
+
+    tui.send(b"\r");
+    tui.read_through("\x1b[?1006l");
+    tui.read_through("✓ Set");
+    assert_private_file(&config.destination(), b"osecret");
+    tui.send(b"q");
+    tui.expect_successful_exit();
+}
+
+#[test]
 fn tui_masks_a_paste_and_waits_for_explicit_submission() {
     let config = Fixture::new();
     let destination = config.destination();

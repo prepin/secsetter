@@ -1,7 +1,9 @@
 use std::io::{self, IsTerminal, Stdout, Write, stdout};
 
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -29,10 +31,10 @@ impl Screen {
         Ok(screen)
     }
 
-    pub(super) fn draw(&mut self, draw: impl FnOnce(&mut Frame) -> bool) -> io::Result<bool> {
-        let mut usable = false;
-        self.terminal.draw(|frame| usable = draw(frame))?;
-        Ok(usable)
+    pub(super) fn draw<T>(&mut self, draw: impl FnOnce(&mut Frame) -> T) -> io::Result<T> {
+        let mut rendered = None;
+        self.terminal.draw(|frame| rendered = Some(draw(frame)))?;
+        Ok(rendered.expect("successful draw rendered a frame"))
     }
 
     pub(super) fn with_terminal<T>(
@@ -71,6 +73,22 @@ impl Screen {
         raw.and(screen)?;
         self.active = false;
         Ok(())
+    }
+}
+
+pub(super) struct MouseCapture;
+
+impl MouseCapture {
+    pub(super) fn enable() -> io::Result<Self> {
+        let capture = Self;
+        execute!(stdout(), EnableMouseCapture)?;
+        Ok(capture)
+    }
+}
+
+impl Drop for MouseCapture {
+    fn drop(&mut self) {
+        let _ = execute!(stdout(), DisableMouseCapture);
     }
 }
 

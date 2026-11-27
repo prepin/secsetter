@@ -31,6 +31,8 @@ Default config: $XDG_CONFIG_HOME/secsetter/config.toml, or
 Validate a draft: secsetter -c ./draft.toml validate
 Group related entries in the terminal UI with section = \"VPN\".
 Custom sections appear alphabetically before Templates, Secrets, Files, Logins, and Fnox.
+Set url on a secret-file or secret-field entry to link to its token page.
+Press o in the list, or click Open token page or press Ctrl+O in the secret popup.
 For config examples: secsetter skill
 For command help: secsetter <command> --help"
     );

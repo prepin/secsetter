@@ -2,13 +2,17 @@ mod screen;
 mod view;
 
 use std::io;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 
 use crate::app::{Action, App, CopyDestination, Status, copy_destination};
 use crate::config::{Entry, Kind};
 use crate::login;
-use screen::Screen;
+use screen::{MouseCapture, Screen};
 use view::{Panel, View};
 
 struct Confirmation {
@@ -93,6 +97,7 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
         .unwrap_or(0);
     let mut confirm: Option<Confirmation> = None;
     let mut notice = String::new();
+    let mut browser = Browser::default();
     loop {
         let view = View {
             app,
@@ -106,8 +111,8 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
             },
             None => Panel::Notice(&notice),
         };
-        let usable = screen.draw(|frame| view.render(frame, panel))?;
-        let Event::Key(key) = event::read()? else {
+        let (usable, _) = screen.draw(|frame| view.render(frame, panel))?;
+        let Some(Event::Key(key)) = browser.read_event(&mut notice)? else {
             continue;
         };
         if key.kind == KeyEventKind::Release
@@ -152,6 +157,13 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+            KeyCode::Char('o')
+                if key.modifiers.is_empty()
+                    && key.kind == KeyEventKind::Press
+                    && let Some(url) = entry.and_then(|entry| entry.url.as_deref()) =>
+            {
+                notice = browser.open(url);
+            }
             KeyCode::Delete => {
                 if let Some(entry) = entry {
                     match app.status(entry) {
@@ -213,7 +225,7 @@ pub(crate) fn run(app: &App) -> io::Result<()> {
                             }
                         }
                         Kind::SecretFile { .. } | Kind::SecretField { .. } => {
-                            notice = match prompt_secret(&mut screen, &view)? {
+                            notice = match prompt_secret(&mut screen, &view, &mut browser)? {
                                 Some(secret) => perform(
                                     app,
                                     &mut screen,
@@ -261,10 +273,17 @@ fn perform(
     Ok(result.map_or_else(|error| error, str::to_owned))
 }
 
-fn prompt_secret(screen: &mut Screen, view: &View<'_>) -> io::Result<Option<String>> {
+fn prompt_secret(
+    screen: &mut Screen,
+    view: &View<'_>,
+    browser: &mut Browser,
+) -> io::Result<Option<String>> {
+    let url = view.selected_entry().and_then(|entry| entry.url.as_deref());
+    let _mouse = url.map(|_| MouseCapture::enable()).transpose()?;
     let mut secret = String::new();
+    let mut notice = String::new();
     loop {
-        let usable = screen.draw(|frame| {
+        let (usable, link) = screen.draw(|frame| {
             let counts: Vec<_> = secret
                 .rsplit('\n')
                 .take(usize::from(frame.area().height))
@@ -278,11 +297,24 @@ fn prompt_secret(screen: &mut Screen, view: &View<'_>) -> io::Result<Option<Stri
                     line.chars().count()
                 })
                 .collect();
-            view.render(frame, Panel::Secret(&counts))
+            view.render(
+                frame,
+                Panel::Secret {
+                    counts: &counts,
+                    notice: &notice,
+                },
+            )
         })?;
-        match event::read()? {
-            Event::Paste(text) if usable => secret.push_str(&text),
-            Event::Key(key) if key.kind != KeyEventKind::Release => {
+        match browser.read_event(&mut notice)? {
+            Some(Event::Paste(text)) if usable => secret.push_str(&text),
+            Some(Event::Mouse(mouse))
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                    && link.is_some_and(|link| link.contains((mouse.column, mouse.row).into()))
+                    && let Some(url) = url =>
+            {
+                notice = browser.open(url);
+            }
+            Some(Event::Key(key)) if key.kind != KeyEventKind::Release => {
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     return Ok(None);
                 }
@@ -291,6 +323,15 @@ fn prompt_secret(screen: &mut Screen, view: &View<'_>) -> io::Result<Option<Stri
                     && key.modifiers == KeyModifiers::CONTROL
                 {
                     secret.push('\n');
+                    continue;
+                }
+                if usable
+                    && key.code == KeyCode::Char('o')
+                    && key.modifiers == KeyModifiers::CONTROL
+                    && key.kind == KeyEventKind::Press
+                    && let Some(url) = url
+                {
+                    notice = browser.open(url);
                     continue;
                 }
                 if !key.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
@@ -311,6 +352,58 @@ fn prompt_secret(screen: &mut Screen, view: &View<'_>) -> io::Result<Option<Stri
                 }
             }
             _ => {}
+        }
+    }
+}
+
+#[derive(Default)]
+struct Browser {
+    openers: Vec<Child>,
+}
+
+impl Browser {
+    fn open(&mut self, url: &str) -> String {
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        match Command::new(opener)
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => {
+                self.openers.push(child);
+                String::new()
+            }
+            Err(error) => format!("Could not open token page: {error}"),
+        }
+    }
+
+    fn read_event(&mut self, notice: &mut String) -> io::Result<Option<Event>> {
+        loop {
+            let mut failed = false;
+            self.openers.retain_mut(|child| {
+                let result = match child.try_wait() {
+                    Ok(None) => return true,
+                    Ok(Some(status)) if status.success() => return false,
+                    Ok(Some(status)) => status.to_string(),
+                    Err(error) => error.to_string(),
+                };
+                *notice = format!("Could not open token page: {result}");
+                failed = true;
+                false
+            });
+            if failed {
+                return Ok(None);
+            }
+            // Some Linux openers stay alive for the browser's lifetime.
+            if self.openers.is_empty() || event::poll(Duration::from_millis(100))? {
+                return event::read().map(Some);
+            }
         }
     }
 }
