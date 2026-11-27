@@ -5,7 +5,7 @@ pub(crate) const SKILL: &str = include_str!("../skills/secsetter/SKILL.md");
 
 pub(crate) fn print() {
     println!(
-        "SecSetter installs templates, sets secrets, and runs login actions.
+        "SecSetter installs templates, sets secrets, restores fnox files, and runs login actions.
 
 {USAGE}
 
@@ -13,8 +13,9 @@ Without a command, SecSetter opens the terminal UI.
 Use the arrow keys or j/k to move through the entry list.
 
 Options:
-  -c <file>  Select a config file. Relative paths start at the current directory.
-  --help     Show this help.
+  -c <file>  Select a config file. Put this option before the command.
+             Relative paths start at the current directory.
+  --help     Show this help. Use <command> --help for command-specific help.
 
 Commands:
   validate                 Validate the config without running any actions.
@@ -29,13 +30,20 @@ Commands:
 Default config: $XDG_CONFIG_HOME/secsetter/config.toml, or
 ~/.config/secsetter/config.toml if XDG_CONFIG_HOME is unset or empty.
 
+Config options:
+  section     Group entries of any kind in the terminal UI: section = \"VPN\".
+              Custom sections sort alphabetically, ignoring case.
+              Entries without section go under Templates, Secrets (fields),
+              Files (whole-file secrets), Logins, or Fnox, in that order.
+  url         Link a secret-file or secret-field entry to its token page.
+              Use an absolute HTTP(S) URL without credentials. Press o in the
+              list, or press Ctrl+O or click Open token page in the popup.
+  commands    Set the ordered steps of a login entry as arrays of literal arguments.
+  ready_when  Set optional local login checks: file-exists and field-set.
+
 Validate a draft: secsetter -c ./draft.toml validate
-Group related entries in the terminal UI with section = \"VPN\".
-Custom sections appear alphabetically before Templates, Secrets, Files, Logins, and Fnox.
-Set url on a secret-file or secret-field entry to link to its token page.
-Press o in the list, or click Open token page or press Ctrl+O in the secret popup.
-For config examples: secsetter skill
-For command help: secsetter <command> --help"
+For copyable TOML examples: secsetter skill
+Help and skill do not require a config file."
     );
 }
 
@@ -53,6 +61,7 @@ For config examples, run 'secsetter skill'.",
         Some("list") => (
             "list",
             "Print tab-separated entry IDs, labels, and local statuses for this platform.
+Entries keep their config order regardless of section.
 Login actions without readiness checks omit the status column.",
         ),
         Some("install") => (
@@ -79,8 +88,11 @@ There is no confirmation prompt. The stored fnox copy remains available.",
         Some("login") => (
             "login <id>",
             "Run the login action identified by <id> in the current terminal.
-Steps run in order and stop on the first failure or interruption.
-The command still runs if local checks show Login configured.",
+Set commands as arrays: commands = [[\"example\", \"login\"]].
+Each step starts with an executable and passes its remaining arguments literally.
+SecSetter does not interpret shell syntax. It stops at the first failure or interruption.
+If you set ready_when checks and all pass, list shows Login configured.
+The checks describe local state. They do not verify credentials or prevent login.",
         ),
         Some("skill") => (
             "skill",

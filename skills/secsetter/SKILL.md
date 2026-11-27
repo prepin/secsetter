@@ -1,6 +1,6 @@
 ---
 name: secsetter
-description: Write or edit a SecSetter TOML config for templates, secrets, fnox files, or login actions. Validate a draft with SecSetter before it goes into use.
+description: Write or edit a SecSetter TOML config for templates, secrets, fnox files, or login actions. Group entries, add token page links, and validate the config.
 ---
 
 # Write a SecSetter config
@@ -18,11 +18,11 @@ Validation reads only the config and checks entries for all platforms. It does n
 - Use an absolute path, `~/`, or `$XDG_CONFIG_HOME/` for destinations and readiness check paths. The `-c` option does not change how these prefixes expand.
 - A template `source` is relative to `templates/` beside the selected config. A fnox `source` is the literal key that fnox uses for the stored file.
 - Omit `platforms` for an entry that applies everywhere. Use `platforms = ["linux"]` or `platforms = ["macos"]` for a platform-specific entry. Use distinct IDs for separate entries.
-- For a File Entry that needs elevation, set `privileged = true` and specify `owner` and `group`. Use account names that exist on the target platform. Login Actions run as the current user.
+- For a file entry that needs elevation, set `privileged = true` and specify `owner` and `group`. Use user and group names that exist on the target platform. Login actions run as the current user.
 
 ## Sections
 
-Set `section = "VPN"` on each entry that belongs in the **VPN** section of the TUI. A section can contain any mix of entry kinds. Names are case-sensitive and cannot be blank or contain control characters.
+Set `section = "VPN"` on each entry that belongs in the **VPN** section of the terminal UI. A section can contain any mix of entry kinds. Names are case-sensitive and cannot be blank or contain control characters. The `group` field sets the Unix group for a privileged file entry.
 
 Custom sections appear first, in alphabetical order without regard to case. Entries without `section` appear in these default sections, in order:
 
@@ -34,11 +34,11 @@ Custom sections appear first, in alphabetical order without regard to case. Entr
 | Logins | `login` |
 | Fnox | `fnox-file` |
 
-The TUI omits empty sections. Entries within each section keep their config order. `secsetter list` keeps the original config order.
+The terminal UI omits empty sections. Entries within each section keep their config order. `secsetter list` keeps the original order and has no section column.
 
 ## Token pages
 
-Set `url` on a `secret-field` or `secret-file` entry to link to the page where you create or rotate its token. Use an absolute HTTP or HTTPS URL without credentials. Keep token values out of the URL.
+To link to the page where you create or rotate a token, set `url` on its entry. Only `secret-field` and `secret-file` accept this optional field. Use an absolute HTTP or HTTPS URL without credentials. Keep token values out of the URL.
 
 Press `o` on the selected entry to open the page in your default browser. In the secret popup, click **Open token page** or press **Ctrl+O**. The popup keeps any text you entered.
 
@@ -52,6 +52,7 @@ Copy the entries that match the task. Replace example IDs, paths, keys, and comm
 id = "example-config"
 label = "Example config"
 kind = "template"
+section = "Example"
 source = "example.toml"
 destination = "$XDG_CONFIG_HOME/example/config.toml"
 
@@ -60,9 +61,11 @@ destination = "$XDG_CONFIG_HOME/example/config.toml"
 id = "example-token"
 label = "Token in example config"
 kind = "secret-field"
+section = "Example"
 destination = "$XDG_CONFIG_HOME/example/config.toml"
 format = "toml"
 key = ["credentials", "token"]
+url = "https://example.com/settings/tokens"
 
 # Write a secret as an entire file.
 [[entries]]
@@ -90,6 +93,7 @@ group = "root"
 id = "example-login"
 label = "Example sign-in"
 kind = "login"
+section = "Example"
 commands = [
   ["example", "login"],
   ["example", "setup"],
@@ -103,7 +107,7 @@ ready_when = [
 ## Fields and login checks
 
 - For `secret-field` and `field-set`, choose `format = "toml"`, `"yaml"`, or `"json"`. List each key as a separate string. A dot within a key is literal. Key paths cannot traverse arrays. To set a field, the file and all parent objects must exist.
-- A one-step Login Action still uses `commands = [["example", "login"]]`. Each step contains an executable followed by its literal arguments. SecSetter uses no implicit shell and stops at the first failure or interruption.
-- Omit `ready_when` to show no login status. If all checks pass, SecSetter shows **Login configured**. If any required file or value is absent, SecSetter shows **Login needed**. If SecSetter cannot complete a check and none are known to fail, it shows **Unknown**.
+- A login entry requires `commands`, even for one step: `commands = [["example", "login"]]`. Each step starts with an executable. SecSetter passes the remaining arguments literally and does not interpret shell syntax. Steps run in order and stop at the first failure or interruption.
+- If `ready_when` is absent or empty (`[]`), SecSetter shows no login status. If all checks pass, SecSetter shows **Login configured**. If any required file or value is absent, SecSetter shows **Login needed**. If SecSetter cannot complete a check and none fail, it shows **Unknown**.
 - A `file-exists` check accepts an empty regular file. A `field-set` check requires a non-empty string.
-- Readiness checks describe local files. They do not verify credentials. A Login Action can run regardless of its status.
+- Readiness checks describe local files. They do not verify credentials. A login action can run regardless of its status.
